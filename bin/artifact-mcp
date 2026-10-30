@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Newline-delimited stdio JSON-RPC MCP adapter (2025-06-18)."""
+import json
+import sys
+from artifact_cli import Client
+
+TOOLS=[
+ {'name':'artifact_resolve','description':'Resolve artifact IDs or aliases, optionally expand source pointers','inputSchema':{'type':'object','properties':{'ids':{'type':'array','items':{'type':'string'},'maxItems':100},'expand':{'type':'boolean'}},'required':['ids'],'additionalProperties':False}},
+ {'name':'artifact_search','description':'Search artifact titles and summaries','inputSchema':{'type':'object','properties':{'q':{'type':'string'},'surface':{'type':'string'}},'required':['q'],'additionalProperties':False}},
+ {'name':'artifact_list','description':'List artifacts belonging to a surface','inputSchema':{'type':'object','properties':{'surface':{'type':'string'}},'required':['surface'],'additionalProperties':False}},
+ {'name':'artifact_upsert','description':'Create or update an artifact pointer (requires write scope)','inputSchema':{'type':'object','properties':{
+  'id':{'type':'string'},'kind':{'type':'string'},'title':{'type':'string','maxLength':200},'summary':{'type':'string','maxLength':1200},'surface':{'type':'string'},'owner_job':{'type':'string'},'parent':{'type':['string','null']},'url':{'type':['string','null']},'selector':{'type':['string','null']},'access':{'enum':['private','internal','public']},'status':{'enum':['active','retired']},'sync_source':{'type':['string','null']},'refs':{'type':'array','maxItems':40,'items':{'type':'object'}},'aliases':{'type':'array','items':{'type':'string'}}},'additionalProperties':False}}
+]
+
+def handle(req):
+    if not isinstance(req,dict) or req.get('jsonrpc')!='2.0' or not isinstance(req.get('method'),str):
+        return {'jsonrpc':'2.0','id':req.get('id') if isinstance(req,dict) else None,'error':{'code':-32600,'message':'Invalid request'}}
+    if 'id' not in req: return None
+    method=req['method']; params=req.get('params',{})
+    base={'jsonrpc':'2.0','id':req['id']}
+    if not isinstance(params,dict): return dict(base,error={'code':-32602,'message':'Invalid params'})
+    if method=='initialize':
+        return dict(base,result={'protocolVersion':'2025-06-18','capabilities':{'tools':{'listChanged':False}},'serverInfo':{'name':'artifact-registry','version':'1.0.0'}})
+    if method=='ping': return dict(base,result={})
+    if method=='tools/list': return dict(base,result={'tools':TOOLS})
+    if method=='tools/call':
+        try:
+            name=params.get('name'); args=params.get('arguments',{})
+            schema=next((t['inputSchema'] for t in TOOLS if t['name']==name),None)
+            if schema is None: raise ValueError('unknown tool')
+            if not isinstance(args,dict) or set(args)-set(schema['properties']) or any(k not in args for k in schema.get('required',[])):
+                raise ValueError('invalid tool arguments')
+            if name=='artifact_resolve' and (not isinstance(args['ids'],list) or len(args['ids'])>100 or any(not isinstance(i,str) for i in args['ids'])):
+                raise ValueError('ids must be an array of strings (maximum 100)')
+            if 'expand' in args and type(args['expand'])!=bool: raise ValueError('expand must be boolean')
+            for key in ('q','surface'):
+                if key in args and not isinstance(args[key],str): raise ValueError(key+' must be a string')
+            client=Client()
+            if name=='artifact_resolve': result=client.resolve(args['ids'],args.get('expand',False))
+            elif name=='artifact_search': result=client.search(args['q'],args.get('surface'))
+            elif name=='artifact_list': result=client.list(args['surface'])
+            else: result=client.upsert(args)
+            return dict(base,result={'content':[{'type':'text','text':json.dumps(result,ensure_ascii=False)}]})
+        except (ValueError,OSError) as e:
+            return dict(base,result={'isError':True,'content':[{'type':'text','text':str(e)}]})
+    return dict(base,error={'code':-32601,'message':'Method not found'})
+
+def main():
+    for line in sys.stdin:
+        try:
+            if len(line)>300000: raise ValueError('request too large')
+            response=handle(json.loads(line))
+        except ValueError:
+            response={'jsonrpc':'2.0','id':None,'error':{'code':-32700,'message':'Parse error'}}
+        if response is not None:
+            print(json.dumps(response,ensure_ascii=False),flush=True)
+if __name__=='__main__': main()
