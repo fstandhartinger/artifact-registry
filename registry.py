@@ -8,12 +8,13 @@ import secrets
 import sys
 import threading
 import time
+import uuid
 import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, unquote
 
 import psycopg
 from psycopg.rows import dict_row
@@ -384,13 +385,14 @@ class Handler(BaseHTTPRequestHandler):
     server_version='ArtifactRegistry/1'
     def log_message(self,*args): pass
     def reply(self,status,data):
-        raw=json.dumps(data,default=lambda x:x.isoformat(),ensure_ascii=False).encode()
+        raw=json.dumps(data,default=lambda x:str(x) if isinstance(x,uuid.UUID) else x.isoformat(),ensure_ascii=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8')
         self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','no-store')
         self.send_header('X-Content-Type-Options','nosniff'); self.end_headers(); self.wfile.write(raw)
     def do_GET(self): self.handle_api()
     def do_POST(self): self.handle_api()
     def do_PUT(self): self.handle_api()
+    def do_DELETE(self): self.handle_api()
     def handle_api(self):
         status=500; actor=None
         try:
@@ -440,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
             if not token: fail('invalid bearer token',401)
             self.token=token
             self.actor=token['name']
-            scope=('admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
+            scope=('devices' if path=='/v1/devices' or path.startswith('/v1/devices/') else 'dict' if path.startswith('/v1/dictionary/') else 'admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
             if scope not in token['scopes']: fail('insufficient scope: '+scope,403)
             body={}
             if self.command!='GET':
@@ -448,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
                 try: length=int(self.headers.get('Content-Length','0'))
                 except ValueError: fail('invalid content length',400)
                 if length<0 or length>MAX_BODY: fail('body exceeds 256 KB',413)
-                try: body=json.loads(self.rfile.read(length))
+                try: body=json.loads(self.rfile.read(length)) if length else {}
                 except (ValueError,UnicodeError): fail('invalid JSON body',400)
                 if not isinstance(body,dict): fail('JSON body must be an object')
                 db.execute('SELECT pg_advisory_xact_lock(734927100)')
@@ -456,6 +458,43 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200,result)
     def dispatch(self,db,path,q,b,actor):
         get=lambda key,default='':q.get(key,[default])[0]
+        if path=='/v1/devices' and self.command=='GET':
+            return {'devices':db.execute("SELECT id,label,scopes,created_at,expires_at,revoked_at,last_seen FROM device WHERE revoked_at IS NULL AND expires_at>now() ORDER BY created_at DESC LIMIT 1000").fetchall()}
+        if path in ('/v1/devices','/v1/devices/verify') and self.command=='POST':
+            digest=b.get('hash')
+            if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest): fail('invalid device hash')
+            if path.endswith('/verify'):
+                row=db.execute("SELECT id,scopes,expires_at,last_seen FROM device WHERE hash=%s AND revoked_at IS NULL AND expires_at>now()",(digest,)).fetchone()
+                if not row: fail('device not found',404)
+                db.execute("UPDATE device SET last_seen=now() WHERE id=%s AND (last_seen IS NULL OR last_seen<now()-interval '1 minute')",(row['id'],))
+                row.pop('last_seen',None)
+                return row
+            label=text_field(b.get('label'),'label',100,False)
+            guard(label)
+            scopes=b.get('scopes')
+            if not isinstance(scopes,list) or not scopes or len(scopes)>4 or any(not isinstance(v,str) or v not in {'dictate','dictionary','screen','exists'} for v in scopes): fail('invalid device scopes')
+            expiry=b.get('expires_at')
+            if type(expiry) is not int: fail('expires_at must be Unix milliseconds')
+            current=int(time.time()*1000)
+            if not current<expiry<=current+90*86400000+60000: fail('invalid device expiry')
+            if db.execute("SELECT count(*) AS n FROM device WHERE revoked_at IS NULL AND expires_at>now()").fetchone()['n']>=1000: fail('device limit reached',429)
+            did=uuid.uuid4()
+            db.execute('INSERT INTO device(id,hash,label,scopes,expires_at) VALUES(%s,%s,%s,%s,%s)',(did,digest,label,list(dict.fromkeys(scopes)),datetime.fromtimestamp(expiry/1000,timezone.utc)))
+            audit(db,actor,'device_create')
+            return {'id':str(did)}
+        if path.startswith('/v1/devices/') and self.command=='DELETE':
+            try: did=uuid.UUID(path.removeprefix('/v1/devices/'))
+            except ValueError: fail('invalid device id')
+            row=db.execute('UPDATE device SET revoked_at=coalesce(revoked_at,now()) WHERE id=%s RETURNING id',(did,)).fetchone()
+            if not row: fail('device not found',404)
+            audit(db,actor,'device_revoke')
+            return {'ok':True}
+        if path.startswith('/v1/dictionary/') and self.command=='DELETE':
+            term=text_field(unquote(path.removeprefix('/v1/dictionary/')),'term',200,False)
+            row=db.execute("DELETE FROM dictionary WHERE term=%s AND source='learned' RETURNING term",(term,)).fetchone()
+            if not row: fail('learned term not found',404)
+            audit(db,actor,'dictionary_delete')
+            return {'ok':True}
         if self.command=='GET':
             if path in ('/v1/resolve','/v1/exists'):
                 ids=get('ids').split(',') if get('ids') else []
@@ -535,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
             for replacement in replacements: text_field(replacement,'replace_from',200,False); guard(replacement)
             source=b.get('source','manual')
             if not isinstance(source,str) or source not in {'wispr','harvest','learned','manual'}: fail('invalid dictionary source')
-            db.execute('INSERT INTO dictionary(term,replace_from,source) VALUES(%s,%s,%s) ON CONFLICT(term) DO UPDATE SET replace_from=(SELECT ARRAY(SELECT DISTINCT unnest(dictionary.replace_from || EXCLUDED.replace_from))),source=EXCLUDED.source',(term,replacements,source))
+            db.execute("INSERT INTO dictionary(term,replace_from,source) VALUES(%s,%s,%s) ON CONFLICT(term) DO UPDATE SET replace_from=(SELECT ARRAY(SELECT DISTINCT unnest(dictionary.replace_from || EXCLUDED.replace_from))),source=CASE WHEN dictionary.source='learned' THEN EXCLUDED.source ELSE dictionary.source END",(term,replacements,source))
             audit(db,actor,'dictionary')
             return {'term':term}
         fail('endpoint not found',404)

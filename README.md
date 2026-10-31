@@ -358,3 +358,27 @@ no credential values. Review the unit paths and credential loading for another h
 The installed sync symlink must point to a persistent checkout; after merging, move
 it to the main checkout. Skill source for installation is in
 `deploy/agent-artifact-ids.SKILL.md`.
+
+
+## Device credentials (migration 003)
+
+Apply `migrations/003_devices.sql` to the registry database after 001/002, before deploying
+Desk's registry-backed device service. It is idempotent and grants the `devices` API scope to
+the existing token named `desk`; no other token gains access. API token caches expire after
+60 seconds (restart the registry to apply the grant immediately). No plaintext device tokens
+are stored or returned; callers provide HMAC-SHA256 hashes.
+
+- `POST /v1/devices`: `{hash,label,scopes,expires_at}` -> `{id}`. hash is 64 lowercase hex,
+  scopes is a nonempty subset of dictate/dictionary/screen/exists; expires_at is Unix milliseconds
+  in the next 90 days. At most 1000 active devices. IDs are UUIDs.
+- `POST /v1/devices/verify`: `{hash}` -> `{id,scopes,expires_at}`; expires_at is ISO 8601 UTC.
+  Revoked/expired/unknown hashes return 404. last_seen writes occur at most once per minute.
+- `GET /v1/devices`: `{devices:[{id,label,scopes,created_at,expires_at,revoked_at,last_seen}]}`
+  lists active devices with ISO timestamps. Hashes never appear in lists.
+- `DELETE /v1/devices/:id`: empty body or `{}` -> `{ok:true}`; sets revoked_at idempotently.
+- `DELETE /v1/dictionary/:term`: scope dict, URL-encoded term, empty body or `{}` -> `{ok:true}`.
+  Only source=learned rows can be deleted; manual/harvest/wispr/unknown return 404.
+  A learned upsert does not convert an existing non-learned row into a deletable learned row.
+
+The integration test applies migration 003 twice in its owned throwaway database and checks
+device scope, create/list/verify, last_seen throttling, expiry/revoke and learned-only deletion.
