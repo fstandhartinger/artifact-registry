@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && useradd --create-home --uid 10001 artifacts
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir -r requirements.txt && useradd --create-home --uid 10001 artifacts
 COPY --chown=artifacts:artifacts registry.py ./
 COPY --chown=artifacts:artifacts bin ./bin
 COPY --chown=artifacts:artifacts data ./data
