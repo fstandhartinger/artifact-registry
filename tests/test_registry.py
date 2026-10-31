@@ -42,8 +42,10 @@ class RegistryTests(unittest.TestCase):
             assert db.execute("SELECT title FROM artifact WHERE id='ffffff'").fetchone()[0]=='Existing'
             assert db.execute("SELECT origin FROM artifact_ref WHERE artifact_id='ffffff'").fetchone()[0]=='agent'
             assert db.execute("SELECT artifact_id FROM artifact_alias WHERE alias='card:999'").fetchone()[0]=='ffffff'
-            for name,scopes in [('all',['read','write','dict','sync','timer','admin']),('desk',['read','dict']),('writer',['write']),('reader',['read'])]:
+            for name,scopes in [('all',['read','write','dict','sync','timer','admin','devices']),('desk',['read','dict']),('writer',['write']),('reader',['read'])]:
                 db.execute('INSERT INTO token(name,hash,scopes) VALUES(%s,%s,%s)',(name,hashlib.sha256(('test-'+name).encode()).hexdigest(),scopes))
+            migration3=(Path(__file__).resolve().parents[1]/'migrations/003_devices.sql').read_text()
+            db.execute(migration3); db.execute(migration3)
         cls.server=Server(('127.0.0.1',0),cls.dsn)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True); cls.thread.start()
         cls.base='http://127.0.0.1:'+str(cls.server.server_port)
@@ -55,7 +57,7 @@ class RegistryTests(unittest.TestCase):
         self.sha_patch=patch('registry.sha_missing',return_value=False)
         self.sha_patch.start(); self.addCleanup(self.sha_patch.stop)
         with psycopg.connect(self.dsn) as db:
-            db.execute('TRUNCATE artifact,artifact_alias,artifact_ref,artifact_link,sync_state,audit,dictionary CASCADE')
+            db.execute('TRUNCATE device,artifact,artifact_alias,artifact_ref,artifact_link,sync_state,audit,dictionary CASCADE')
     def request(self,path,body=None,token='all',method=None,raw=None):
         headers={'Content-Type':'application/json'}
         if token is not None: headers['Authorization']='Bearer test-'+token
@@ -548,5 +550,32 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(client.request.call_args.kwargs,{'after':'bbbbbb'})
         client.request.side_effect=[{'items':[{'id':'aaaaaa','refs':[]}]},RegistryHTTPError(503,'unavailable')]
         with self.assertRaises(RegistryHTTPError): verify_refs(client)
+
+    def test_devices_and_learned_delete(self):
+        import time
+        body={'hash':'a'*64,'label':'Laptop','scopes':['screen','dictate'],'expires_at':int(time.time()*1000)+600000}
+        self.assertEqual(self.request('/v1/devices',body,token='reader')[0],403)
+        status, row=self.request('/v1/devices',body,token='desk'); self.assertEqual(status,200)
+        did=row['id']
+        self.assertEqual(self.request('/v1/devices',body,token='desk')[0],409)
+        status, listed=self.request('/v1/devices',token='desk'); self.assertEqual(status,200)
+        self.assertNotIn('hash',listed['devices'][0])
+        for _ in range(2): self.assertEqual(self.request('/v1/devices/verify',{'hash':'a'*64},token='desk')[0],200)
+        with psycopg.connect(self.dsn) as db:
+            seen=db.execute('SELECT last_seen FROM device WHERE id=%s',(did,)).fetchone()[0]
+        self.request('/v1/devices/verify',{'hash':'a'*64},token='desk')
+        with psycopg.connect(self.dsn) as db:
+            self.assertEqual(db.execute('SELECT last_seen FROM device WHERE id=%s',(did,)).fetchone()[0],seen)
+        self.assertEqual(self.request('/v1/devices/'+did,token='desk',method='DELETE')[0],200)
+        self.assertEqual(self.request('/v1/devices/verify',{'hash':'a'*64},token='desk')[0],404)
+        body['hash']='b'*64
+        _,row=self.request('/v1/devices',body,token='desk')
+        with psycopg.connect(self.dsn) as db: db.execute("UPDATE device SET expires_at=now()-interval '1 second' WHERE id=%s",(row['id'],))
+        self.assertEqual(self.request('/v1/devices/verify',{'hash':'b'*64},token='desk')[0],404)
+        self.request('/v1/dictionary',{'term':'Learned','source':'learned'},token='desk')
+        self.request('/v1/dictionary',{'term':'Manual','source':'manual'},token='desk')
+        self.assertEqual(self.request('/v1/dictionary/Learned',token='reader',method='DELETE')[0],403)
+        self.assertEqual(self.request('/v1/dictionary/Manual',token='desk',method='DELETE')[0],404)
+        self.assertEqual(self.request('/v1/dictionary/Learned',token='desk',method='DELETE')[0],200)
 
 if __name__=='__main__': unittest.main()
