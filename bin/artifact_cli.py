@@ -55,8 +55,8 @@ class Client:
             raise ValueError(f'registry HTTP {e.code}: {message}') from None
         except (urllib.error.URLError,TimeoutError):
             raise ValueError('registry unavailable') from None
-    def resolve(self,ids,expand=False):
-        result=self.request('/v1/resolve',ids=','.join(ids))
+    def resolve(self,ids,expand=False,depth=1):
+        result=self.request('/v1/resolve',ids=','.join(ids),depth=depth)
         if expand:
             for item in result['items']:
                 item['expanded_refs']=[{'ref':r,'text':expand_ref(r,item.get('access'))} for r in item.get('refs',[])]
@@ -186,10 +186,78 @@ def stamp(path,aid):
     Image.alpha_composite(image,overlay).save(output)
     return str(output)
 
+def pool_action(action, surface, client=None, root=None):
+    import fcntl
+    import tempfile
+    root=Path(root) if root is not None else Path.home()/'.config/artifact-ids'
+    root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    if not isinstance(surface,str) or not surface or len(surface)>200: raise ValueError('invalid surface')
+    path=root/('pool-'+urllib.parse.quote(surface,safe='')+'.json')
+    lock=os.open(str(path)+'.lock',os.O_CREAT|os.O_RDWR,0o600)
+    try:
+        os.fchmod(lock,0o600)
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        ids=json.loads(path.read_text()) if path.exists() else []
+        if not isinstance(ids,list) or len(ids)>200: raise ValueError('invalid pool')
+        ids=[normalise(i) for i in ids]
+        if len(set(ids))!=len(ids): raise ValueError('duplicate ids in pool')
+        if action=='refill':
+            if len(ids)<50:
+                more=(client or Client()).request('/v1/ids',{'surface':surface,'count':200-len(ids)})['ids']
+                ids.extend(normalise(i) for i in more)
+                if len(ids)!=200 or len(set(ids))!=200: raise ValueError('invalid allocation response')
+            result={'count':len(ids)}
+        elif action=='take':
+            if not ids: raise ValueError('pool empty; refill online first')
+            result={'id':'a#'+ids.pop(0)}
+        else: raise ValueError('unknown pool action')
+        fd,tmp=tempfile.mkstemp(prefix=path.name+'.',dir=root)
+        try:
+            with os.fdopen(fd,'w') as handle:
+                json.dump(ids,handle); handle.flush(); os.fsync(handle.fileno())
+            os.replace(tmp,path)
+            directory=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try: os.fsync(directory)
+            finally: os.close(directory)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+        return result
+    finally: os.close(lock)
+
+def check_code_ref(ref, repos):
+    match=re.fullmatch(r'github:([\w.-]+/[\w.-]+)@([^:]+):([^#]+)(?:#.*)?',ref['target'])
+    if not match: return 'invalid code reference'
+    repo,rev,path=match.groups(); pinned=ref.get('pinned_sha') or rev
+    if not re.fullmatch(r'[0-9a-f]{7,64}',pinned): return 'code ref lacks pinned sha'
+    if path.startswith('/') or '..' in Path(path).parts: return 'invalid code path'
+    for version,label in [(pinned,'pinned sha'),('HEAD','HEAD')]:
+        if repo in repos:
+            args=['git','-C',str(repos[repo]),'cat-file','-e',version+':'+path]
+        else:
+            args=['gh','api','repos/'+repo+'/contents/'+urllib.parse.quote(path,safe='/')+'?ref='+version,'--silent']
+        try:
+            result=subprocess.run(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+            if result.returncode: return 'code path missing or unavailable at '+label
+        except (OSError,subprocess.TimeoutExpired): return 'code ref verification unavailable'
+    return None
+
+def verify_refs(client, repos=None):
+    after=''; checked=0; stale=0
+    while True:
+        rows=client.request('/v1/verify-refs',after=after)['items']
+        if not rows: break
+        for row in rows:
+            reasons=sorted(set(filter(None,(check_code_ref(ref,repos or {}) for ref in row['refs']))))
+            reason='; '.join(reasons) or None
+            client.request('/v1/verify-refs',{'id':row['id'],'refs':row['refs'],'stale_reason':reason})
+            checked+=1; stale+=bool(reason)
+        after=normalise(rows[-1]['id'])
+    return {'checked':checked,'stale':stale}
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description='Resolve and register artifact pointers')
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('resolve'); p.add_argument('ids',nargs='+'); p.add_argument('--expand',action='store_true'); p.add_argument('--json',action='store_true')
+    p=sub.add_parser('resolve'); p.add_argument('ids',nargs='+'); p.add_argument('--expand',action='store_true'); p.add_argument('--json',action='store_true'); p.add_argument('--depth',type=int,choices=[0,1,2],default=1)
     p=sub.add_parser('search'); p.add_argument('q'); p.add_argument('--surface')
     p=sub.add_parser('list'); p.add_argument('--surface',required=True)
     p=sub.add_parser('new')
@@ -204,10 +272,22 @@ def main(argv=None):
     ds.add_parser('list')
     p=ds.add_parser('add'); p.add_argument('term'); p.add_argument('--from',dest='replace_from',action='append',default=[]); p.add_argument('--source',default='manual')
     p=ds.add_parser('import'); p.add_argument('file'); p.add_argument('--source',default='wispr')
+    p=sub.add_parser('pool'); ps=p.add_subparsers(dest='action',required=True)
+    for action in ('refill','take'):
+        pp=ps.add_parser(action); pp.add_argument('--surface',required=True)
+    p=sub.add_parser('link'); p.add_argument('src'); p.add_argument('rel'); p.add_argument('dst')
+    p=sub.add_parser('verify-refs'); p.add_argument('--repo',action='append',default=[],metavar='OWNER/REPO=PATH')
     args=parser.parse_args(argv)
     try:
+        if args.command=='pool':
+            print(json.dumps(pool_action(args.action,args.surface))); return 0
         client=Client()
-        if args.command=='resolve': result=client.resolve(args.ids,args.expand)
+        if args.command=='resolve': result=client.resolve(args.ids,args.expand,args.depth)
+        elif args.command=='link':
+            rows=client.resolve([args.src],depth=0)['items']
+            if not rows: raise ValueError('source artifact not found')
+            result=client.upsert({'id':rows[0]['id'],'links':[{'rel':args.rel,'to':args.dst}]})
+        elif args.command=='verify-refs': result=verify_refs(client,dict(r.split('=',1) for r in args.repo))
         elif args.command=='search': result=client.search(args.q,args.surface)
         elif args.command=='list': result=client.list(args.surface)
         elif args.command=='new':

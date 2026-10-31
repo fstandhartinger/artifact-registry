@@ -5,11 +5,11 @@ import sys
 from artifact_cli import Client
 
 TOOLS=[
- {'name':'artifact_resolve','description':'Resolve artifact IDs or aliases, optionally expand source pointers','inputSchema':{'type':'object','properties':{'ids':{'type':'array','items':{'type':'string'},'maxItems':100},'expand':{'type':'boolean'}},'required':['ids'],'additionalProperties':False}},
+ {'name':'artifact_resolve','description':'Resolve artifact IDs or aliases, optionally expand source pointers','inputSchema':{'type':'object','properties':{'ids':{'type':'array','items':{'type':'string'},'maxItems':100},'expand':{'type':'boolean'},'depth':{'type':'integer','enum':[0,1,2],'default':1}},'required':['ids'],'additionalProperties':False}},
  {'name':'artifact_search','description':'Search artifact titles and summaries','inputSchema':{'type':'object','properties':{'q':{'type':'string'},'surface':{'type':'string'}},'required':['q'],'additionalProperties':False}},
  {'name':'artifact_list','description':'List artifacts belonging to a surface','inputSchema':{'type':'object','properties':{'surface':{'type':'string'}},'required':['surface'],'additionalProperties':False}},
  {'name':'artifact_upsert','description':'Create or update an artifact pointer (requires write scope)','inputSchema':{'type':'object','properties':{
-  'id':{'type':'string'},'kind':{'type':'string'},'title':{'type':'string','maxLength':200},'summary':{'type':'string','maxLength':1200},'surface':{'type':'string'},'owner_job':{'type':'string'},'parent':{'type':['string','null']},'url':{'type':['string','null']},'selector':{'type':['string','null']},'access':{'enum':['private','internal','public']},'status':{'enum':['active','retired']},'sync_source':{'type':['string','null']},'refs':{'type':'array','maxItems':40,'items':{'type':'object'}},'aliases':{'type':'array','items':{'type':'string'}}},'additionalProperties':False}}
+  'id':{'type':'string'},'kind':{'type':'string'},'title':{'type':'string','maxLength':200},'summary':{'type':'string','maxLength':1200},'surface':{'type':'string'},'owner_job':{'type':'string'},'parent':{'type':['string','null']},'url':{'type':['string','null']},'selector':{'type':['string','null']},'access':{'enum':['private','internal','public']},'status':{'enum':['active','retired']},'sync_source':{'type':['string','null']},'refs':{'type':'array','maxItems':40,'items':{'type':'object'}},'links':{'type':'array','maxItems':100,'items':{'type':'object','properties':{'rel':{'type':'string'},'to':{'type':'string'}},'required':['rel','to']}},'aliases':{'type':'array','items':{'type':'string'}}},'additionalProperties':False}}
 ]
 
 def handle(req):
@@ -33,10 +33,11 @@ def handle(req):
             if name=='artifact_resolve' and (not isinstance(args['ids'],list) or len(args['ids'])>100 or any(not isinstance(i,str) for i in args['ids'])):
                 raise ValueError('ids must be an array of strings (maximum 100)')
             if 'expand' in args and type(args['expand'])!=bool: raise ValueError('expand must be boolean')
+            if 'depth' in args and (type(args['depth']) is not int or args['depth'] not in (0,1,2)): raise ValueError('depth must be 0, 1 or 2')
             for key in ('q','surface'):
                 if key in args and not isinstance(args[key],str): raise ValueError(key+' must be a string')
             client=Client()
-            if name=='artifact_resolve': result=client.resolve(args['ids'],args.get('expand',False))
+            if name=='artifact_resolve': result=client.resolve(args['ids'],args.get('expand',False),args.get('depth',1))
             elif name=='artifact_search': result=client.search(args['q'],args.get('surface'))
             elif name=='artifact_list': result=client.list(args['surface'])
             else: result=client.upsert(args)
