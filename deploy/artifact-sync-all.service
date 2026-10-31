@@ -2,5 +2,5 @@
 Description=Sync registered artifact manifests at GitHub HEAD
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '. %h/.config/dev-secrets.env; if [ -r %h/.config/extra-secrets.env ]; then . %h/.config/extra-secrets.env; fi; export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-$GITHUB_PAT}}"; exec %h/bin/artifact-sync-all'
+ExecStart=/bin/bash -c '. %h/.config/dev-secrets.env; if [ -r %h/.config/extra-secrets.env ]; then . %h/.config/extra-secrets.env; fi; export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-$GITHUB_PAT}}"; %h/bin/artifact pool refill --surface telegram >/dev/null || true; exec %h/bin/artifact-sync-all'
 TimeoutStartSec=10min
