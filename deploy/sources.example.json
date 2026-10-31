@@ -1,0 +1,12 @@
+[
+  {
+    "repo": "fstandhartinger/bittensor-earnings",
+    "path": "src/artifacts.manifest.json",
+    "branch": "main",
+    "surface": "app:bittensor-earnings",
+    "alias_prefix": "earnings:",
+    "url": "https://bittensor-earnings.lovable.app/reax",
+    "owner_job": "agent-artifact-ids-screen-agent-20261030",
+    "access": "private"
+  }
+]
