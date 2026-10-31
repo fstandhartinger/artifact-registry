@@ -26,7 +26,12 @@ MAX_BODY = 256 * 1024
 BIP39_WORDS = frozenset((Path(__file__).parent/'data/bip39-english.txt').read_text().splitlines())
 KINDS = {'app','page','panel','element','card','explainer','scene','diagram','doc','job','tweet','board-entry','finance'}
 REF_KINDS = {'code','repo','file','board','decision','readme','doc','endpoint','url','job','card','explainer','artifact'}
-SECRET = re.compile(r'(?i)(?:\b(?:sk-|(?:ghp|github_pat|gho|art|hf)_|xox[baprs]-)[a-z0-9_-]{8,}|\bAKIA[A-Z0-9]{16}\b|\bbearer\s+\S+|\beyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret[_ -]?key)\s*[:=]\s*\S+|\b(?:seed phrase|recovery phrase|mnemonic)\b|\b[a-z]{2}\d{2}(?:[ \t]?[a-z0-9]){11,30}\b)')
+SECRET = re.compile(r'(?i)(?:\b(?:sk-|(?:ghp|github_pat|gho|art|hf)_|xox[baprs]-)[a-z0-9_-]{8,}|\bAKIA[A-Z0-9]{16}\b|\bbearer\s+\S+|\beyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret[_ -]?key)\s*[:=]\s*\S+|\b(?:seed phrase|recovery phrase|mnemonic)\b)')
+# IBAN: uppercase country code + check digits + 11-30 alphanumerics in optional groups of 4, digit-heavy.
+IBAN = re.compile(r'\b[A-Z]{2}\d{2}(?:[ \t]?[A-Z0-9]){11,30}\b')
+
+def has_iban(value):
+    return any(sum(c.isdigit() for c in m.group(0)) >= 10 for m in IBAN.finditer(value.upper()))
 AMOUNT = re.compile(r'(?i)(?:[$€£¥₹₿αΞ]|\b(?:EUR|USD|GBP|CHF|JPY|CNY|CAD|AUD|INR|TAO|BTC|ETH|USDT|USDC|SOL|BNB|REAX)\b)\s*[-+]?\s*[\d., ]*\d|\d[\d., ]*\s*(?:[$€£¥₹₿αΞ]|\b(?:EUR|USD|GBP|CHF|JPY|CNY|CAD|AUD|INR|TAO|BTC|ETH|USDT|USDC|SOL|BNB|REAX)\b)')
 RELS = {'related','explains','explained_by','discussed_in','decided_by','supersedes','superseded_by','depends_on','shows_data_of'}
 INVERSE = {'explains':'explained_by','explained_by':'explains','supersedes':'superseded_by','superseded_by':'supersedes'}
@@ -91,7 +96,7 @@ def text_field(value, name, limit, empty=True):
 def guard(value, finance=False):
     if finance and re.search(r"(?i)[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", value):
         fail("title/summary contains an email; store a reference instead")
-    if SECRET.search(value):
+    if SECRET.search(value) or has_iban(value):
         fail('title/summary contains a possible secret, credential or IBAN; store a reference instead')
     # Detect embedded standard English mnemonic sequences without rejecting prose by word count.
     run = 0
