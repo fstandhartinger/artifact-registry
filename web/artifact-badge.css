@@ -1,0 +1,4 @@
+/* Give the badge container position: relative in the host stylesheet. */
+.aid[data-aid] { position: absolute; top: .35rem; right: .45rem; font: 11px/1.3 ui-monospace, monospace; opacity: .55; cursor: copy; z-index: 1; }
+.aid[data-aid]:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; opacity: 1; }
+.aid-toast { position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%); z-index: 2147483647; padding: .3rem .6rem; border-radius: .3rem; background: #222; color: #fff; font: 12px/1.4 system-ui, sans-serif; pointer-events: none; }

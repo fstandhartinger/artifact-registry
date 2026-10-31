@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily artifact source reference verification
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15min
+Persistent=true
+[Install]
+WantedBy=timers.target

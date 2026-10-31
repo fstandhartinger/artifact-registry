@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync artifact manifests every 15 minutes
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+[Install]
+WantedBy=timers.target

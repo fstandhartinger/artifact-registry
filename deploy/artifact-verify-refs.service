@@ -1,0 +1,6 @@
+[Unit]
+Description=Verify artifact source references
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '. %h/.config/dev-secrets.env; if [ -r %h/.config/extra-secrets.env ]; then . %h/.config/extra-secrets.env; fi; exec %h/bin/artifact verify-refs'
+TimeoutStartSec=30min

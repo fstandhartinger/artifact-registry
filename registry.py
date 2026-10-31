@@ -399,6 +399,20 @@ class Handler(BaseHTTPRequestHandler):
             self.sha_deadline=time.monotonic()+2
             if self.command=='GET' and path=='/healthz':
                 status=200; self.reply(200,{'ok':True}); return
+            if self.command=='GET' and path.startswith('/static/'):
+                # Exact allowlist: never map a request path onto the filesystem.
+                assets={'/static/artifact-badge.js':'text/javascript',
+                        '/static/artifact-badge.css':'text/css'}
+                if path not in assets: fail('asset not found',404)
+                raw=(Path(__file__).parent/'web'/path.rsplit('/',1)[1]).read_bytes()
+                status=200
+                self.send_response(status)
+                self.send_header('Content-Type',assets[path]+'; charset=utf-8')
+                self.send_header('Content-Length',str(len(raw)))
+                self.send_header('Cache-Control','public, max-age=3600')
+                self.send_header('Access-Control-Allow-Origin','*')
+                self.send_header('X-Content-Type-Options','nosniff')
+                self.end_headers(); self.wfile.write(raw); return
             auth=self.headers.get('Authorization','')
             if not auth.startswith('Bearer ') or not auth[7:].strip() or len(auth)>512: fail('bearer token required',401)
             digest=hashlib.sha256(auth[7:].encode()).hexdigest()

@@ -270,13 +270,17 @@ def verify_refs(client, repos=None):
 def sync_manifest(path,generation=None):
     path=Path(path).resolve()
     payload=json.loads(path.read_text())
+    return sync_payload(payload,generation,path.parent)
+
+def sync_payload(payload,generation=None,git_dir=None):
     if not isinstance(payload,dict): raise ValueError('sync manifest must be an object')
+    payload=dict(payload)
     # Preserve items arrays and component-keyed objects; server validates their rows.
     if generation is not None:
         payload['generation']=generation
     elif 'generation' not in payload:
         try:
-            result=subprocess.run(['git','-C',str(path.parent),'log','-1','--format=%ct:%H'],
+            result=subprocess.run(['git','-C',str(git_dir or Path.cwd()),'log','-1','--format=%ct:%H'],
                                   capture_output=True,text=True,timeout=10,check=True)
             value=result.stdout.strip()
             if not re.fullmatch(r'\d+:[0-9a-f]{7,64}',value): raise ValueError('invalid git generation')

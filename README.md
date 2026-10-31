@@ -328,3 +328,33 @@ upgrade a populated copy of the v1 schema, then verify both old routes and v2
 semantics. OCR vectors in `testdata/ocr-ids.json` are shared consumer fixtures;
 exact candidates sort before OCR substitutions, results are deduplicated and
 capped at 20, and callers must confirm candidates with `/v1/exists`.
+
+### Shared badges and central manifest sync
+
+Include `/static/artifact-badge.css` and deferred `/static/artifact-badge.js` from the
+registry origin, then render `<span class="aid" data-aid="b8c3ff">a#b8c3ff</span>`
+inside a positioned container. These two exact GET routes are anonymous; API routes
+retain bearer authentication. Assets cache for one hour. The badge supports click
+and Enter/Space copying, a short success toast, and dynamically inserted elements.
+Allow the asset origin in CSP `script-src`/`style-src`; inline permissions are not needed.
+
+`bin/artifact-sync-all` reads `~/.config/artifact-sync/sources.json` (example in
+`deploy/sources.example.json`). Each entry names `repo`, `path`, `branch`; a normal
+manifest contains `surface` and `items`. Legacy keyed objects need a source `surface`;
+`alias_prefix` adds `<prefix><key>` aliases. Source `url`, `owner_job`, `access` are
+optional item defaults. The runner resolves branch HEAD once, fetches its immutable
+manifest through `gh api`, and sends the CLI's shared sync payload with generation
+`<commit unix time>:<sha>` and source `github:<repo>/<path>`. Only a 409
+`stale_generation` counts as no change; other errors cause a nonzero exit after
+remaining sources run. One JSON line per source is appended to
+`~/.local/state/artifact-sync/log`; payloads and credentials are never logged.
+
+To install locally, symlink `bin/artifact-sync-all` into `~/bin`, copy the four unit
+files in `deploy/` into `~/.config/systemd/user/`, run `systemctl --user daemon-reload`,
+then `systemctl --user enable --now artifact-sync-all.timer artifact-verify-refs.timer`.
+The sync timer runs every 15 minutes; reference verification runs daily. Units load
+the existing private `dev-secrets.env` and optional `extra-secrets.env`; they contain
+no credential values. Review the unit paths and credential loading for another host.
+The installed sync symlink must point to a persistent checkout; after merging, move
+it to the main checkout. Skill source for installation is in
+`deploy/agent-artifact-ids.SKILL.md`.
