@@ -73,9 +73,14 @@ def run(sources_path, log_path, client=None):
             except RegistryHTTPError as error:
                 if error.status==409 and str(error)=='registry HTTP 409: stale_generation': status='no change'
                 else: raise
-        except (ValueError,KeyError,TypeError,OSError,subprocess.SubprocessError):
-            errors+=1; status='error'  # no manifest or private API response in logs
-        line=json.dumps(dict(at=datetime.now(timezone.utc).isoformat(),**label,status=status),ensure_ascii=True)
+        except (ValueError,KeyError,TypeError,OSError,subprocess.SubprocessError) as error:
+            errors+=1; status='error'
+            # Only the exception class and a registry status/code; never manifest or API response bodies.
+            reason=type(error).__name__
+            if isinstance(error,RegistryHTTPError): reason=str(error)[:80]
+        else:
+            reason=None
+        line=json.dumps(dict(at=datetime.now(timezone.utc).isoformat(),**label,status=status,**({'reason':reason} if reason else {})),ensure_ascii=True)
         with log_path.open('a') as handle: handle.write(line+'\n')
         print(line)
     return 1 if errors else 0
