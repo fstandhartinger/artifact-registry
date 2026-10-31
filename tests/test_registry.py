@@ -42,7 +42,7 @@ class RegistryTests(unittest.TestCase):
             assert db.execute("SELECT title FROM artifact WHERE id='ffffff'").fetchone()[0]=='Existing'
             assert db.execute("SELECT origin FROM artifact_ref WHERE artifact_id='ffffff'").fetchone()[0]=='agent'
             assert db.execute("SELECT artifact_id FROM artifact_alias WHERE alias='card:999'").fetchone()[0]=='ffffff'
-            for name,scopes in [('all',['read','write','dict']),('desk',['read','dict']),('writer',['write']),('reader',['read'])]:
+            for name,scopes in [('all',['read','write','dict','sync','timer','admin']),('desk',['read','dict']),('writer',['write']),('reader',['read'])]:
                 db.execute('INSERT INTO token(name,hash,scopes) VALUES(%s,%s,%s)',(name,hashlib.sha256(('test-'+name).encode()).hexdigest(),scopes))
         cls.server=Server(('127.0.0.1',0),cls.dsn)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True); cls.thread.start()
@@ -161,7 +161,7 @@ class RegistryTests(unittest.TestCase):
         registry._SHA_CACHE.clear()
         self.sha_patch.stop()
         try:
-            self.assertTrue(registry.sha_missing(ref,time.monotonic()-1))
+            self.assertIsNone(registry.sha_missing(ref,time.monotonic()-1))
             opener=MagicMock()
             opener.open.return_value.__enter__.return_value.status=200
             with patch('registry.urllib.request.build_opener',return_value=opener):
@@ -355,9 +355,9 @@ class RegistryTests(unittest.TestCase):
             self.assertIsNone(check_code_ref(ref,{'example/local':root}))
             self.create(refs=[ref])
             with patch.dict(os.environ,ARTIFACTS_URL=self.base,ARTIFACTS_AGENT_TOKEN='test-all'):
-                self.assertEqual(verify_refs(Client(),{'example/local':root}),{'checked':1,'stale':0})
+                self.assertEqual(verify_refs(Client(),{'example/local':root}),{'checked':1,'stale':0,'conflicts':0})
                 (Path(root)/'code.py').unlink(); git('add','.'); git('commit','-m','remove')
-                self.assertEqual(verify_refs(Client(),{'example/local':root}),{'checked':1,'stale':1})
+                self.assertEqual(verify_refs(Client(),{'example/local':root}),{'checked':1,'stale':1,'conflicts':0})
             row=self.get_ids('resolve','abc123')[1]['items'][0]
             self.assertIsNotNone(row['refs_verified_at']); self.assertIn('HEAD',row['stale_reason']); self.assertTrue(row['stale'])
             self.assertIn('pinned sha',check_code_ref(dict(ref,pinned_sha='f'*40),{'example/local':root}))
@@ -366,5 +366,187 @@ class RegistryTests(unittest.TestCase):
                 self.assertIsNone(check_code_ref(ref,{})); self.assertEqual(run.call_count,2)
                 self.assertEqual(run.call_args.args[0][0:2],['gh','api'])
             self.assertEqual(self.request('/v1/verify-refs',{'id':'abc123','refs':[],'stale_reason':None})[0],409)
+
+    def test_fix_atomic_migration_preflight_grants_and_delete(self):
+        root=Path(__file__).resolve().parents[1]
+        with psycopg.connect(self.dsn,autocommit=True) as db:
+            db.execute('CREATE SCHEMA migration_probe')
+            try:
+                db.execute('SET search_path TO migration_probe,public')
+                db.execute((root/'migrations/001_init.sql').read_text())
+                db.execute("INSERT INTO artifact(id,kind,title,surface) VALUES('aaaaaa','doc','A','test'),('bbbbbb','doc','B','test')")
+                db.execute("INSERT INTO artifact_alias VALUES('Card:1','aaaaaa'),('card:1','bbbbbb')")
+                db.execute("INSERT INTO token(name,hash,scopes) VALUES('sync','x',ARRAY['read']),('agent','y',ARRAY['write']),('other','z',ARRAY['write'])")
+                with self.assertRaisesRegex(psycopg.errors.RaiseException,'case-variant alias duplicates: card:1'):
+                    db.execute((root/'migrations/002_v2.sql').read_text())
+                db.execute('ROLLBACK')
+                self.assertIsNone(db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='migration_probe' AND table_name='token' AND column_name='surfaces'").fetchone())
+                self.assertIsNone(db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='migration_probe' AND table_name='artifact_ref' AND column_name='origin'").fetchone())
+                db.execute("DELETE FROM artifact_alias WHERE alias='Card:1'")
+                db.execute((root/'migrations/002_v2.sql').read_text())
+                scopes=dict(db.execute('SELECT name,scopes FROM token').fetchall())
+                self.assertEqual(scopes,{'sync':['read','sync'],'agent':['write','sync'],'other':['write']})
+                self.assertTrue(all('admin' not in v for v in scopes.values()))
+                with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+                    db.execute("DELETE FROM artifact WHERE id='bbbbbb'")
+                # Documented v1 rollback: dropping this trigger allows alias rewrites.
+                db.execute('DROP TRIGGER artifact_alias_immutable ON artifact_alias')
+                db.execute("DELETE FROM artifact_alias WHERE alias='card:1'")
+                db.execute("INSERT INTO artifact_alias VALUES('card:1','bbbbbb')")
+            finally:
+                db.execute('ROLLBACK')
+                db.execute('SET search_path TO public')
+                db.execute('DROP SCHEMA migration_probe CASCADE')
+
+    def test_fix_scopes_surfaces_generation_and_admin_reset(self):
+        import time
+        with psycopg.connect(self.dsn) as db:
+            for name,scopes,surfaces in [('scoped',['read','write','sync'],['app:owned*','exact']),('sync-only',['sync'],['app:owned*']),('admin-only',['admin'],['app:owned*'])]:
+                db.execute('INSERT INTO token(name,hash,scopes,surfaces) VALUES(%s,%s,%s,%s) ON CONFLICT(name) DO UPDATE SET scopes=EXCLUDED.scopes,surfaces=EXCLUDED.surfaces',
+                           (name,hashlib.sha256(('test-'+name).encode()).hexdigest(),scopes,surfaces))
+        self.server.token_cache.clear()
+        m={'surface':'app:owned-one','sync_source':'m','generation':1,'items':[],'allow_shrink':True}
+        self.assertEqual(self.request('/v1/sync',m,token='writer')[0],403)
+        self.assertEqual(self.request('/v1/sync',m,token='sync-only')[0],200)
+        self.assertEqual(self.request('/v1/ids',{'surface':m['surface']},token='sync-only')[0],403)
+        self.assertEqual(self.request('/v1/sync',dict(m,surface='app:other'),token='scoped')[0],403)
+        for value in (10**20-1,str(int(time.time())+86401)+':'+'a'*40):
+            self.assertEqual(self.request('/v1/sync',dict(m,generation=value),token='scoped')[0],422)
+        reset={'surface':m['surface'],'sync_source':'m'}
+        self.assertEqual(self.request('/v1/admin/sync-reset',reset,token='scoped')[0],403)
+        self.assertEqual(self.request('/v1/admin/sync-reset',dict(reset,surface='app:other'),token='admin-only')[0],403)
+        self.assertEqual(self.request('/v1/admin/sync-reset',reset,token='admin-only')[0],200)
+        self.assertEqual(self.request('/v1/sync',m,token='sync-only')[0],200)
+        for surface,status in [('app:owned-one',200),('exact',200),('exact-more',403),('app:other',403)]:
+            self.assertEqual(self.request('/v1/ids',{'surface':surface},token='scoped')[0],status)
+            self.assertEqual(self.request('/v1/artifacts',{'kind':'doc','title':'A','surface':surface},token='scoped')[0],status)
+        self.create('aaaaaa',surface='app:other')
+        self.create('bbbbbb',surface='app:owned-one')
+        self.assertEqual(self.request('/v1/artifacts/bbbbbb',{'links':[{'rel':'related','to':'aaaaaa'}]},method='PUT',token='scoped')[0],403)
+        self.assertEqual(self.request('/v1/artifacts/aaaaaa',{'title':'Changed'},method='PUT',token='scoped')[0],403)
+        self.assertEqual(self.request('/v1/artifacts/aaaaaa',{'surface':'app:owned-one'},method='PUT',token='scoped')[0],409)
+
+    def test_fix_ref_origins_and_all_nonpublic_guards(self):
+        self.create()
+        self.assertEqual(self.request('/v1/artifacts/abc123',{'refs':[{'kind':'file','target':'/a','origin':'manifest'}]},method='PUT',token='writer')[0],200)
+        self.assertEqual(self.get_ids('resolve','abc123')[1]['items'][0]['refs'][0]['origin'],'agent')
+        self.assertEqual(self.request('/v1/artifacts/abc123',{'refs':[{'kind':'file','target':'/timer','origin':'timer'}]},method='PUT',token='writer')[0],403)
+        self.assertEqual(self.request('/v1/artifacts/abc123',{'refs':[{'kind':'file','target':'/timer','origin':'timer'}]},method='PUT')[0],200)
+        self.assertEqual({r['origin'] for r in self.get_ids('resolve','abc123')[1]['items'][0]['refs']},{'agent','timer'})
+        for access in ('private','internal'):
+            for data in ({'title':'Revenue EUR 250000'}, {'summary':'Revenue EUR 250000'}, {'refs':[{'kind':'file','target':'/a','label':'EUR 123456'}]}):
+                self.assertEqual(self.request('/v1/artifacts',dict({'kind':'doc','title':'Doc','surface':'job:z','access':access},**data))[0],422)
+        self.assertEqual(self.request('/v1/artifacts',{'kind':'doc','title':'Revenue EUR 250000','surface':'job:z','access':'public'})[0],200)
+        self.create('bbbbbb')
+        for value in ('https://u:p@example.com/x','https://example.com/?token=abc','api_key=private'):
+            for field in ('url','selector'):
+                self.assertEqual(self.request('/v1/artifacts/abc123',{field:value},method='PUT')[0],422)
+            self.assertEqual(self.request('/v1/artifacts/abc123',{'links':[{'rel':'related','to':'bbbbbb','note':value}]},method='PUT')[0],422)
+        self.assertEqual(self.request('/v1/artifacts/abc123',{'refs':[{'kind':'file','target':'/a','label':'sk-abcdefghijkl'}]},method='PUT')[0],422)
+        for target in ('github:../repo@'+'a'*40+':x','github:owner/.@'+'a'*40+':x'):
+            self.assertEqual(self.request('/v1/artifacts/abc123',{'refs':[{'kind':'code','target':target}]},method='PUT')[0],422)
+
+    def test_fix_auth_preflight_connection_capacity_cache(self):
+        import registry
+        from unittest.mock import MagicMock
+        with patch('registry.psycopg.connect') as connect:
+            for token in (None,'x'*600):
+                self.assertEqual(self.request('/v1/list',token=token)[0],401)
+            connect.assert_not_called()
+        for _ in range(8): self.assertTrue(self.server.connections.acquire(blocking=False))
+        try:
+            with patch('registry.psycopg.connect') as connect:
+                self.assertEqual(self.request('/v1/list')[0],503)
+                connect.assert_not_called()
+        finally:
+            for _ in range(8): self.server.connections.release()
+        db=MagicMock(); db.execute.return_value=[{'name':'cached','hash':'a'*64,'scopes':['read'],'surfaces':None}]
+        self.server.token_cache.clear()
+        with patch('registry.time.monotonic',return_value=100):
+            self.assertEqual(self.server.authenticate(db,'a'*64)['name'],'cached')
+        with patch('registry.time.monotonic',return_value=159): self.server.authenticate(db,'a'*64)
+        self.assertEqual(db.execute.call_count,1)
+        with patch('registry.time.monotonic',return_value=161): self.server.authenticate(db,'a'*64)
+        self.assertEqual(db.execute.call_count,2)
+        self.server.token_cache.clear()
+
+    def test_fix_surface_reserved_quota_atomic(self):
+        with psycopg.connect(self.dsn) as db:
+            db.execute("INSERT INTO artifact(id,kind,title,surface,status) SELECT lpad(to_hex(n),6,'0'),'element','','quota','reserved' FROM generate_series(1,1999) n")
+        self.assertEqual(self.request('/v1/ids',{'surface':'quota','count':2})[0],429)
+        with psycopg.connect(self.dsn) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM artifact WHERE surface='quota'").fetchone()[0],1999)
+        self.assertEqual(self.request('/v1/ids',{'surface':'quota'})[0],200)
+        self.assertEqual(self.request('/v1/ids',{'surface':'quota'})[0],429)
+        self.assertEqual(self.request('/v1/ids',{'surface':'different'})[0],200)
+        self.assertEqual(self.request('/v1/artifacts/000001',{'kind':'doc','title':'Activated'},method='PUT')[0],200)
+        self.assertEqual(self.request('/v1/ids',{'surface':'quota'})[0],200)
+
+    def test_fix_sha_unknown_optional_token_and_dot_segments(self):
+        import registry,time,os
+        from unittest.mock import MagicMock
+        ref={'kind':'code','target':'github:owner/repo@'+'a'*40+':x'}
+        self.sha_patch.stop()
+        try:
+            opener=MagicMock()
+            for error in (urllib.error.HTTPError('https://api.github.com',404,'hidden',{},None),urllib.error.HTTPError('https://api.github.com',403,'rate',{},None),OSError('offline')):
+                registry._SHA_CACHE.clear(); opener.open.side_effect=error
+                with patch('registry.urllib.request.build_opener',return_value=opener),patch.dict(os.environ,{'GITHUB_TOKEN':'test-optional-token'}):
+                    self.assertIsNone(registry.sha_missing(ref,time.monotonic()+2))
+                    self.assertEqual(opener.open.call_args.args[0].get_header('Authorization'),'Bearer test-optional-token')
+            for target in ('github:../repo@'+'a'*40+':x','github:owner/.@'+'a'*40+':x'):
+                with patch('registry.urllib.request.build_opener') as build:
+                    self.assertIsNone(registry.sha_missing(dict(ref,target=target),time.monotonic()+2))
+                    build.assert_not_called()
+            self.create(refs=[ref])
+            registry._SHA_CACHE.clear(); opener.open.side_effect=OSError('offline')
+            with patch('registry.urllib.request.build_opener',return_value=opener):
+                self.assertFalse(self.get_ids('resolve','abc123')[1]['items'][0]['stale'])
+        finally:
+            registry._SHA_CACHE.clear(); self.sha_patch.start()
+
+    def test_fix_cli_sync_git_fallback_keyed_and_override(self):
+        import tempfile
+        from artifact_cli import sync_manifest,main
+        with tempfile.TemporaryDirectory(prefix='p1b-fix-sync-') as root:
+            def git(*args): return subprocess.run(['git','-C',root,*args],capture_output=True,text=True,check=True).stdout.strip()
+            git('init','-q'); git('config','user.email','test@example.invalid'); git('config','user.name','Test')
+            path=Path(root)/'manifest.json'
+            path.write_text(json.dumps({'surface':'app:test','sync_source':'m','items':{'panel':{'id':'abcdef','kind':'panel','title':'Panel'}}}))
+            git('add','.'); git('commit','-qm','manifest')
+            data=sync_manifest(path)
+            self.assertEqual(data['generation'],git('log','-1','--format=%ct:%H'))
+            self.assertIsInstance(data['items'],dict)
+            self.assertEqual(sync_manifest(path,'123:'+'a'*40)['generation'],'123:'+'a'*40)
+            with patch('artifact_cli.Client') as client,contextlib.redirect_stdout(io.StringIO()):
+                client.return_value.request.return_value={'ids':[]}
+                self.assertEqual(main(['sync',str(path),'--generation','123']),0)
+                self.assertEqual(client.return_value.request.call_args.args[1]['generation'],'123')
+            with patch('artifact_cli.subprocess.run',side_effect=OSError),patch('artifact_cli.time.time',return_value=123):
+                self.assertEqual(sync_manifest(path)['generation'],123)
+
+    def test_fix_cli_add_ref_preserves_other_origin_ownership(self):
+        from artifact_cli import main
+        refs=[{'kind':'file','target':'/'+origin,'origin':origin} for origin in ('manifest','agent','timer')]
+        with patch('artifact_cli.Client') as client,contextlib.redirect_stdout(io.StringIO()):
+            client.return_value.resolve.return_value={'items':[{'id':'a#abcdef','refs':refs}]}
+            client.return_value.upsert.return_value={'id':'a#abcdef'}
+            self.assertEqual(main(['add-ref','abcdef','file=/new']),0)
+            self.assertEqual([r['target'] for r in client.return_value.upsert.call_args.args[0]['refs']],['/agent','/new'])
+
+    def test_fix_cli_dot_repos_and_per_row_conflict(self):
+        from artifact_cli import RegistryHTTPError,check_code_ref,verify_refs
+        from unittest.mock import MagicMock
+        for target in ('github:../repo@'+'a'*40+':x','github:owner/.@'+'a'*40+':x'):
+            with patch('artifact_cli.subprocess.run') as run:
+                self.assertEqual(check_code_ref({'target':target},{}),'invalid code repository')
+                self.assertEqual(expand_ref({'kind':'code','target':target}),'[invalid code repository]')
+                run.assert_not_called()
+        client=MagicMock()
+        client.request.side_effect=[{'items':[{'id':'aaaaaa','refs':[]},{'id':'bbbbbb','refs':[]}]},RegistryHTTPError(409,'refs_changed'),{'id':'bbbbbb'},{'items':[]}]
+        self.assertEqual(verify_refs(client),{'checked':1,'stale':0,'conflicts':1})
+        self.assertEqual(client.request.call_args.kwargs,{'after':'bbbbbb'})
+        client.request.side_effect=[{'items':[{'id':'aaaaaa','refs':[]}]},RegistryHTTPError(503,'unavailable')]
+        with self.assertRaises(RegistryHTTPError): verify_refs(client)
 
 if __name__=='__main__': unittest.main()

@@ -32,8 +32,8 @@ RELS = {'related','explains','explained_by','discussed_in','decided_by','superse
 INVERSE = {'explains':'explained_by','explained_by':'explains','supersedes':'superseded_by','superseded_by':'supersedes'}
 FIELDS = {'superseded_by','deployed_rev','kind','title','summary','surface','owner_job','parent','url','selector','access','status','sync_source'}
 
-# SHA checks have a shared two-second budget per request. Fail closed as stale on
-# network errors/rate limits, and cache results for 15 minutes (one minute on errors).
+# SHA checks return None (unknown) when existence cannot be confirmed.
+# GitHub hides private repos with 404; neither 404 nor rate limits prove absence.
 _SHA_CACHE = {}
 _SHA_LOCK = threading.Lock()
 
@@ -42,8 +42,9 @@ def sha_missing(ref, deadline):
         return False
     match = re.fullmatch(r'github:([\w.-]+)/([\w.-]+)(?:@([^:]+))?(?::.*)?',ref['target'])
     if not match:
-        return bool(ref.get('pinned_sha'))
+        return None
     owner, repo, rev = match.groups()
+    if owner in {'.','..'} or repo in {'.','..'}: return None
     sha = ref.get('pinned_sha') or rev
     if not sha or not re.fullmatch(r'[0-9a-f]{7,64}',sha):
         return False
@@ -54,18 +55,19 @@ def sha_missing(ref, deadline):
             return cached[1]
     remaining = deadline-time.monotonic()
     if remaining <= 0:
-        return True
-    missing = True; ttl = 60
+        return None
+    missing = None; ttl = 60
     try:
         req = urllib.request.Request('https://api.github.com/repos/'+owner+'/'+repo+'/git/commits/'+sha,
-                                     headers={'Accept':'application/vnd.github+json','User-Agent':'artifact-registry'})
+                                     headers={'Accept':'application/vnd.github+json','User-Agent':'artifact-registry',
+                                              **({'Authorization':'Bearer '+os.environ['GITHUB_TOKEN']} if os.getenv('GITHUB_TOKEN') else {})})
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self,*args,**kwargs): return None
         with urllib.request.build_opener(NoRedirect).open(req, timeout=min(1.5,remaining)) as response:
-            missing = response.status != 200
-            ttl = 900
+            missing = False if response.status == 200 else None
+            ttl = 900 if missing is False else 60
     except urllib.error.HTTPError as error:
-        if error.code in (404,410,422): ttl = 900
+        if error.code == 410: missing = True; ttl = 900
     except (OSError,ValueError):
         pass
     with _SHA_LOCK:
@@ -109,7 +111,22 @@ def id_value(value):
 def audit(db, actor, action, aid=None, detail=None):
     db.execute('INSERT INTO audit(actor,action,artifact_id,detail) VALUES(%s,%s,%s,%s)', (actor,action,aid,Jsonb(detail or {})))
 
+def require_surface(token, surface):
+    # Exact names or trailing '*' prefix patterns only; NULL means all surfaces.
+    patterns = token.get('surfaces') if token else None
+    if patterns is not None and not any(
+        surface.startswith(p[:-1]) if p.endswith('*') else surface == p
+        for p in patterns
+    ): fail('surface not permitted',403)
+
+def pointer_guard(value):
+    guard(value)
+    if re.search(r'(?i)[a-z][a-z0-9+.-]*://[^/\s]+@|[?&](?:token|key|secret|password|api_key|access_token)=',value):
+        fail('pointer contains a possible credential')
+
 def allocate(db, surface, actor):
+    if db.execute("SELECT count(*) AS n FROM artifact WHERE surface=%s AND status='reserved'",(surface,)).fetchone()['n'] >= 2000:
+        fail('surface reservation quota exceeded',429)
     for _ in range(5):
         aid = secrets.token_hex(3)
         row = db.execute("INSERT INTO artifact(id,kind,title,surface,status) VALUES(%s,'element','',%s,'reserved') ON CONFLICT DO NOTHING RETURNING id", (aid,surface)).fetchone()
@@ -118,7 +135,7 @@ def allocate(db, surface, actor):
             return aid
     fail('id allocation conflict; retry',409)
 
-def upsert(db, item, actor, origin="agent", validate_only=False):
+def upsert(db, item, actor, origin="agent", validate_only=False, token=None):
     if not isinstance(item,dict):
         fail('artifact must be an object')
     if set(item) - FIELDS - {'id','refs','aliases','links'}:
@@ -135,11 +152,13 @@ def upsert(db, item, actor, origin="agent", validate_only=False):
         text_field(data.get(name),name,limit,empty=(name=='summary'))
     if not isinstance(data.get('access'),str) or not isinstance(data.get('status'),str) or data['kind'] not in KINDS or data['access'] not in {'private','internal','public'} or data['status'] not in {'active','retired','reserved'}:
         fail('invalid kind, access or status')
+    require_surface(token,data['surface'])
     if old and old['surface'] != data['surface']:
         fail('owner_mismatch',409)
     for name in ('owner_job','url','selector','sync_source','deployed_rev'):
         if data.get(name) is not None:
             text_field(data[name],name,4096)
+            pointer_guard(data[name])
     if data.get('parent') is not None:
         data['parent'] = id_value(data['parent'])
         if not db.execute('SELECT 1 FROM artifact WHERE id=%s',(data['parent'],)).fetchone(): fail('parent not allocated',409)
@@ -150,7 +169,7 @@ def upsert(db, item, actor, origin="agent", validate_only=False):
     if data.get('superseded_by') is not None:
         data['superseded_by'] = id_value(data['superseded_by'])
         if not db.execute('SELECT 1 FROM artifact WHERE id=%s',(data['superseded_by'],)).fetchone(): fail('superseding artifact not allocated',409)
-    finance = data['surface'].startswith('app:') or data['kind'] in {'finance','panel','element','card'}
+    finance = data['access'] != 'public'
     guard(data['title'],finance); guard(data['summary'],finance)
     refs = item.get('refs')
     if refs is not None:
@@ -161,13 +180,19 @@ def upsert(db, item, actor, origin="agent", validate_only=False):
                 fail('invalid reference')
             if not isinstance(ref.get('origin',origin),str) or ref.get('origin',origin) not in {'manifest','agent','timer'}: fail('invalid ref origin')
             if origin=='manifest' and ref.get('origin','manifest')!='manifest': fail('manifest refs require manifest origin')
+            if origin != 'manifest':
+                if ref.get('origin') == 'timer' and (not token or 'timer' not in token['scopes']):
+                    fail('insufficient scope: timer',403)
+                ref['origin'] = 'timer' if ref.get('origin') == 'timer' else 'agent'
             text_field(ref.get('target'),'ref target',4096,False)
-            # Credentials are forbidden in pointers too (including URL userinfo/query tokens).
-            if SECRET.search(ref['target']) or re.search(r'(?i)https?://[^/\s]+@|[?&](?:token|key|secret|password)=',ref['target']):
-                fail('reference contains a possible credential')
+            pointer_guard(ref['target'])
+            if ref['kind'] in {'code','repo'}:
+                match=re.match(r'github:([^/]+)/([^@:]+)',ref['target'])
+                if match and any(part in {'.','..'} for part in match.groups()): fail('invalid repository')
             for field in ('label','pinned_sha'):
                 if ref.get(field) is not None:
                     text_field(ref[field],field,500)
+            if ref.get('label') is not None: pointer_guard(ref['label']); guard(ref['label'],finance)
             if ref.get('pinned_sha') and not re.fullmatch(r'[0-9a-f]{7,64}',ref['pinned_sha']):
                 fail('invalid pinned_sha')
     aliases = item.get('aliases')
@@ -187,7 +212,7 @@ def upsert(db, item, actor, origin="agent", validate_only=False):
             owner = db.execute('SELECT artifact_id FROM artifact_alias WHERE lower(alias)=%s',(alias,)).fetchone()
             if owner and owner['artifact_id']!=aid:
                 fail('alias_taken',409)
-    links = validate_links(db,item.get('links'))
+    links = validate_links(db,item.get('links'),token)
     if validate_only: return aid
     if not aid:
         aid = allocate(db,data['surface'],actor)
@@ -199,7 +224,9 @@ def upsert(db, item, actor, origin="agent", validate_only=False):
         sql.SQL(',').join(sql.SQL('{}=EXCLUDED.{}').format(sql.Identifier(k),sql.Identifier(k)) for k in sorted(data)))
     db.execute(query,vals)
     if refs is not None:
-        db.execute('DELETE FROM artifact_ref WHERE artifact_id=%s AND origin=%s',(aid,origin))
+        origins = {r.get('origin',origin) for r in refs} or {origin}
+        for ref_origin in origins:
+            db.execute('DELETE FROM artifact_ref WHERE artifact_id=%s AND origin=%s',(aid,ref_origin))
         for n,r in enumerate(refs):
             db.execute('INSERT INTO artifact_ref(artifact_id,kind,target,label,pinned_sha,ord,origin) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(artifact_id,kind,target) DO UPDATE SET label=EXCLUDED.label,pinned_sha=EXCLUDED.pinned_sha,ord=EXCLUDED.ord WHERE artifact_ref.origin=EXCLUDED.origin',(aid,r['kind'],r['target'],r.get('label'),r.get('pinned_sha'),n,r.get('origin',origin)))
     if aliases is not None:
@@ -224,7 +251,7 @@ def lookup(db, value, reserved=False):
         aid = row['artifact_id'] if row else None
     return db.execute("SELECT * FROM artifact WHERE id=%s AND (status!='reserved' OR %s)",(aid,reserved)).fetchone() if aid else None
 
-def validate_links(db, links):
+def validate_links(db, links, token=None):
     if links is None: return []
     if not isinstance(links,list) or len(links)>100: fail('links must be an array of at most 100 entries')
     result=[]
@@ -233,8 +260,9 @@ def validate_links(db, links):
             fail('invalid link')
         target=lookup(db,link.get('to'),reserved=True)
         if not target: fail('link target not allocated',409)
+        require_surface(token,target['surface'])
         note=link.get('note')
-        if note is not None: text_field(note,'link note',1200); guard(note,True)
+        if note is not None: text_field(note,'link note',1200); pointer_guard(note); guard(note,True)
         result.append((link['rel'],target['id'],note))
     return result
 
@@ -265,21 +293,24 @@ def resolve(db,row,deadline=None,depth=0):
     row['stale'] = bool(row.get('stale_reason')) or row['stale'] or any(sha_missing(ref,deadline or time.monotonic()+2) for ref in row['refs'])
     return row
 
-def generation_key(value):
-    # Numeric git commit time, optionally followed by its SHA, avoids lexical 9>10.
-    if type(value) is int and 0 <= value < 10**20: return (value,'')
+def generation_key(value, check_future=False):
+    key = None
+    if type(value) is int and 0 <= value < 10**20: key = (value,'')
     if isinstance(value,str):
         match=re.fullmatch(r'(\d{1,20})(?::([0-9a-f]{7,64}))?',value)
-        if match: return (int(match[1]),match[2] or '')
-    fail('generation must be a nonnegative commit timestamp or timestamp:sha')
+        if match: key = (int(match[1]),match[2] or '')
+    if key is None: fail('generation must be a nonnegative commit timestamp or timestamp:sha')
+    if check_future and key[0] > time.time()+86400: fail('generation exceeds now plus one day')
+    return key
 
-def sync(db,b,actor):
+def sync(db,b,actor,token=None):
     surface=text_field(b.get('surface'),'surface',200,False)
+    require_surface(token,surface)
     source=text_field(b.get('sync_source'),'sync_source',4096,False)
     sha=b.get('sha')
     if sha is not None and (not isinstance(sha,str) or not re.fullmatch(r'[0-9a-f]{7,64}',sha)): fail('invalid sha')
     generation=b.get('generation')
-    key=generation_key(generation)
+    key=generation_key(generation,check_future=True)
     state=db.execute('SELECT generation FROM sync_state WHERE surface=%s AND sync_source=%s FOR UPDATE',(surface,source)).fetchone()
     if state and key<=generation_key(state['generation']): fail('stale_generation',409)
     items=b.get('items')
@@ -334,10 +365,10 @@ def sync(db,b,actor):
         ready=[i for i in pending if not i.get('parent') or id_value(i['parent']) not in waiting]
         if not ready: fail('manifest parent cycle')
         for item in ready:
-            upsert(db,item,actor,origin='manifest',validate_only=True)
+            upsert(db,item,actor,origin='manifest',validate_only=True,token=token)
             ordered.append(item); pending.remove(item)
     for item in ordered:
-        aid=upsert(db,item,actor,origin='manifest')
+        aid=upsert(db,item,actor,origin='manifest',token=token)
         db.execute('UPDATE artifact SET last_verified=now(),last_synced=now() WHERE id=%s',(aid,))
     retired=db.execute("UPDATE artifact SET status='retired',updated_at=now() WHERE surface=%s AND sync_source=%s AND status='active' AND NOT(id=ANY(%s::text[])) RETURNING id",(surface,source,ids)).fetchall()
     db.execute('INSERT INTO sync_state(surface,sync_source,generation,sha) VALUES(%s,%s,%s,%s) ON CONFLICT(surface,sync_source) DO UPDATE SET generation=EXCLUDED.generation,sha=EXCLUDED.sha,at=now()',(surface,source,str(generation),sha))
@@ -363,41 +394,47 @@ class Handler(BaseHTTPRequestHandler):
             self.sha_deadline=time.monotonic()+2
             if self.command=='GET' and path=='/healthz':
                 status=200; self.reply(200,{'ok':True}); return
-            with psycopg.connect(self.server.dsn,row_factory=dict_row) as db:
-                auth=self.headers.get('Authorization','')
-                if not auth.startswith('Bearer ') or len(auth)>512: fail('bearer token required',401)
-                digest=hashlib.sha256(auth[7:].encode()).hexdigest()
-                token=None
-                for row in db.execute('SELECT name,hash,scopes FROM token'):
-                    if hmac.compare_digest(digest,row['hash']): token=row
-                if not token: fail('invalid bearer token',401)
-                actor=token['name']
-                scope='dict' if path=='/v1/dictionary' else ('read' if self.command=='GET' else 'write')
-                if scope not in token['scopes']: fail('insufficient scope: '+scope,403)
-                body={}
-                if self.command!='GET':
-                    if self.headers.get('Transfer-Encoding'): fail('transfer encoding not supported',400)
-                    try: length=int(self.headers.get('Content-Length','0'))
-                    except ValueError: fail('invalid content length',400)
-                    if length<0 or length>MAX_BODY: fail('body exceeds 256 KB',413)
-                    try: body=json.loads(self.rfile.read(length))
-                    except (ValueError,UnicodeError): fail('invalid JSON body',400)
-                    if not isinstance(body,dict): fail('JSON body must be an object')
-                    db.execute('SELECT pg_advisory_xact_lock(734927100)')
-                result=self.dispatch(db,path,parse_qs(parsed.query),body,actor)
-            status=200; self.reply(status,result)
+            auth=self.headers.get('Authorization','')
+            if not auth.startswith('Bearer ') or not auth[7:].strip() or len(auth)>512: fail('bearer token required',401)
+            digest=hashlib.sha256(auth[7:].encode()).hexdigest()
+            if not self.server.connections.acquire(blocking=False): fail('registry connection capacity reached',503)
+            try:
+                self.authenticated_request(parsed,path,digest)
+                status=200
+            finally:
+                self.server.connections.release()
+            return
         except APIError as e:
             status=e.status; self.close_connection=True; self.reply(status,{'error':e.message})
         except psycopg.IntegrityError as e:
             alias_error='alias' in (e.diag.constraint_name or '') or e.diag.message_primary=='alias_taken'
-            status=409; self.close_connection=True; self.reply(status,{'error':'alias_taken' if alias_error else 'constraint conflict (parent or alias)'} )
+            status=409; self.close_connection=True; self.reply(status,{'error':'alias_taken' if alias_error else 'constraint conflict (parent or alias)'})
         except (psycopg.Error,OSError):
             status=503; self.close_connection=True; self.reply(status,{'error':'registry unavailable'})
         except Exception:
             status=500; self.close_connection=True; self.reply(status,{'error':'internal registry error'})
         finally:
-            # Deliberately no query strings, raw paths, request values or bodies.
-            print(json.dumps({'method':self.command,'status':status,'actor':actor}),flush=True)
+            print(json.dumps({'method':self.command,'status':status,'actor':getattr(self,'actor',actor)}),flush=True)
+    def authenticated_request(self,parsed,path,digest):
+        with psycopg.connect(self.server.dsn,row_factory=dict_row) as db:
+            token=self.server.authenticate(db,digest)
+            if not token: fail('invalid bearer token',401)
+            self.token=token
+            self.actor=token['name']
+            scope=('admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
+            if scope not in token['scopes']: fail('insufficient scope: '+scope,403)
+            body={}
+            if self.command!='GET':
+                if self.headers.get('Transfer-Encoding'): fail('transfer encoding not supported',400)
+                try: length=int(self.headers.get('Content-Length','0'))
+                except ValueError: fail('invalid content length',400)
+                if length<0 or length>MAX_BODY: fail('body exceeds 256 KB',413)
+                try: body=json.loads(self.rfile.read(length))
+                except (ValueError,UnicodeError): fail('invalid JSON body',400)
+                if not isinstance(body,dict): fail('JSON body must be an object')
+                db.execute('SELECT pg_advisory_xact_lock(734927100)')
+            result=self.dispatch(db,path,parse_qs(parsed.query),body,token['name'])
+        self.reply(200,result)
     def dispatch(self,db,path,q,b,actor):
         get=lambda key,default='':q.get(key,[default])[0]
         if self.command=='GET':
@@ -440,6 +477,9 @@ class Handler(BaseHTTPRequestHandler):
                 return {'items':db.execute('SELECT * FROM dictionary ORDER BY weight DESC,term').fetchall()}
         if self.command=='POST' and path=='/v1/verify-refs':
             aid=id_value(b.get('id'))
+            row=lookup(db,aid,reserved=True)
+            if not row: fail('not_allocated',409)
+            require_surface(self.token,row['surface'])
             refs=db.execute("SELECT kind,target,pinned_sha FROM artifact_ref WHERE artifact_id=%s AND kind='code' ORDER BY target",(aid,)).fetchall()
             if not refs or refs!=b.get('refs'): fail('refs_changed',409)
             reason=b.get('stale_reason')
@@ -451,16 +491,24 @@ class Handler(BaseHTTPRequestHandler):
             count=b.get('count',1)
             if type(count)!=int or not 1<=count<=200: fail('count must be between 1 and 200')
             surface=text_field(b.get('surface'),'surface',200,False)
+            require_surface(self.token,surface)
             return {'ids':['a#'+allocate(db,surface,actor) for _ in range(count)]}
         if (self.command=='POST' and path=='/v1/artifacts') or (self.command=='PUT' and path.startswith('/v1/artifacts/')):
             if self.command=='PUT':
                 aid=id_value(path.removeprefix('/v1/artifacts/'))
                 if b.get('id') and id_value(b['id'])!=aid: fail('path/body id mismatch')
                 b['id']=aid
-            aid=upsert(db,b,actor)
+            aid=upsert(db,b,actor,token=self.token)
             return {'id':'a#'+aid}
+        if self.command=='POST' and path=='/v1/admin/sync-reset':
+            surface=text_field(b.get('surface'),'surface',200,False)
+            source=text_field(b.get('sync_source'),'sync_source',4096,False)
+            require_surface(self.token,surface)
+            db.execute('DELETE FROM sync_state WHERE surface=%s AND sync_source=%s',(surface,source))
+            audit(db,actor,'sync_reset',detail={'surface':surface,'sync_source':source})
+            return {'reset':True}
         if self.command=='POST' and path=='/v1/sync':
-            return sync(db,b,actor)
+            return sync(db,b,actor,token=self.token)
         if self.command=='POST' and path=='/v1/dictionary':
             term=text_field(b.get('term'),'term',200,False); guard(term)
             replacements=b.get('replace_from',[])
@@ -477,7 +525,22 @@ class Server(ThreadingHTTPServer):
     daemon_threads=True
     def __init__(self,address,dsn):
         self.dsn=dsn
+        self.connections=threading.BoundedSemaphore(8)
+        self.token_cache={}
+        self.token_lock=threading.Lock()
         super().__init__(address,Handler)
+
+    def authenticate(self,db,digest):
+        with self.token_lock:
+            cached=self.token_cache.get(digest)
+            if cached and cached[0]>time.monotonic(): return cached[1]
+        token=None
+        for row in db.execute('SELECT name,hash,scopes,surfaces FROM token'):
+            if hmac.compare_digest(digest,row['hash']): token=row
+        with self.token_lock:
+            if len(self.token_cache)>=4096: self.token_cache.clear()
+            self.token_cache[digest]=(time.monotonic()+60,token)
+        return token
 
 def main():
     Server((os.getenv('ARTIFACTS_BIND','0.0.0.0'),int(os.getenv('PORT','8080'))),os.environ['ARTIFACTS_DATABASE_URL']).serve_forever()

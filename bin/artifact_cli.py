@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,11 @@ def config():
     # Never source shell code; caller's explicit environment always wins.
     values.update({k:v for k,v in os.environ.items() if k.startswith('ARTIFACTS_')})
     return values
+
+class RegistryHTTPError(ValueError):
+    def __init__(self,status,message):
+        self.status=status
+        super().__init__(f'registry HTTP {status}: {message}')
 
 class Client:
     def __init__(self):
@@ -52,7 +58,7 @@ class Client:
         except urllib.error.HTTPError as e:
             try: message=json.load(e).get('error','request refused')
             except (ValueError,AttributeError): message='request refused'
-            raise ValueError(f'registry HTTP {e.code}: {message}') from None
+            raise RegistryHTTPError(e.code,message) from None
         except (urllib.error.URLError,TimeoutError):
             raise ValueError('registry unavailable') from None
     def resolve(self,ids,expand=False,depth=1):
@@ -115,6 +121,7 @@ def expand_ref(ref,access='private'):
             match=re.fullmatch(r'github:([\w.-]+)/([\w.-]+)@([\w./-]+):([^#]+)(?:#L(\d+)(?:-L?(\d+))?)?',target)
             if not match: return '[invalid code reference]'
             owner,repo,rev,path,start,end=match.groups()
+            if owner in {'.','..'} or repo in {'.','..'}: return '[invalid code repository]'
             rev=ref.get('pinned_sha') or rev
             endpoint='repos/'+owner+'/'+repo+'/contents/'+urllib.parse.quote(path,safe='/')+'?ref='+urllib.parse.quote(rev,safe='')
             response=json.loads(run_read(['gh','api',endpoint]))
@@ -228,6 +235,7 @@ def check_code_ref(ref, repos):
     match=re.fullmatch(r'github:([\w.-]+/[\w.-]+)@([^:]+):([^#]+)(?:#.*)?',ref['target'])
     if not match: return 'invalid code reference'
     repo,rev,path=match.groups(); pinned=ref.get('pinned_sha') or rev
+    if any(part in {'.','..'} for part in repo.split('/')): return 'invalid code repository'
     if not re.fullmatch(r'[0-9a-f]{7,64}',pinned): return 'code ref lacks pinned sha'
     if path.startswith('/') or '..' in Path(path).parts: return 'invalid code path'
     for version,label in [(pinned,'pinned sha'),('HEAD','HEAD')]:
@@ -242,17 +250,40 @@ def check_code_ref(ref, repos):
     return None
 
 def verify_refs(client, repos=None):
-    after=''; checked=0; stale=0
+    after=''; checked=0; stale=0; conflicts=0
     while True:
         rows=client.request('/v1/verify-refs',after=after)['items']
         if not rows: break
         for row in rows:
             reasons=sorted(set(filter(None,(check_code_ref(ref,repos or {}) for ref in row['refs']))))
             reason='; '.join(reasons) or None
-            client.request('/v1/verify-refs',{'id':row['id'],'refs':row['refs'],'stale_reason':reason})
+            try:
+                client.request('/v1/verify-refs',{'id':row['id'],'refs':row['refs'],'stale_reason':reason})
+            except RegistryHTTPError as error:
+                if error.status != 409: raise
+                conflicts+=1
+                continue
             checked+=1; stale+=bool(reason)
         after=normalise(rows[-1]['id'])
-    return {'checked':checked,'stale':stale}
+    return {'checked':checked,'stale':stale,'conflicts':conflicts}
+
+def sync_manifest(path,generation=None):
+    path=Path(path).resolve()
+    payload=json.loads(path.read_text())
+    if not isinstance(payload,dict): raise ValueError('sync manifest must be an object')
+    # Preserve items arrays and component-keyed objects; server validates their rows.
+    if generation is not None:
+        payload['generation']=generation
+    elif 'generation' not in payload:
+        try:
+            result=subprocess.run(['git','-C',str(path.parent),'log','-1','--format=%ct:%H'],
+                                  capture_output=True,text=True,timeout=10,check=True)
+            value=result.stdout.strip()
+            if not re.fullmatch(r'\d+:[0-9a-f]{7,64}',value): raise ValueError('invalid git generation')
+            payload['generation']=value
+        except (OSError,subprocess.SubprocessError,ValueError):
+            payload['generation']=int(time.time())
+    return payload
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description='Resolve and register artifact pointers')
@@ -265,7 +296,7 @@ def main(argv=None):
     for name in ('summary','parent','url','selector','owner-job','access'): p.add_argument('--'+name)
     p.add_argument('--ref',action='append',default=[]); p.add_argument('--alias',action='append',default=[])
     p=sub.add_parser('add-ref'); p.add_argument('id'); p.add_argument('ref',help='kind=target'); p.add_argument('--label')
-    p=sub.add_parser('sync'); p.add_argument('manifest')
+    p=sub.add_parser('sync'); p.add_argument('manifest'); p.add_argument('--generation')
     p=sub.add_parser('scan'); p.add_argument('input',nargs='+')
     p=sub.add_parser('stamp'); p.add_argument('png'); p.add_argument('--id',required=True)
     p=sub.add_parser('dict'); ds=p.add_subparsers(dest='action',required=True)
@@ -299,10 +330,10 @@ def main(argv=None):
             item=client.resolve([args.id])['items']
             if not item: raise ValueError('artifact not found')
             row=item[0]; kind,target=args.ref.split('=',1)
-            refs=[{k:v for k,v in r.items() if k!='ord'} for r in row['refs']]
+            refs=[{k:v for k,v in r.items() if k!='ord'} for r in row['refs'] if r.get('origin','agent')=='agent']
             refs.append({'kind':kind,'target':target,'label':args.label})
             result=client.upsert({'id':row['id'],'refs':refs})
-        elif args.command=='sync': result=client.request('/v1/sync',json.loads(Path(args.manifest).read_text()))
+        elif args.command=='sync': result=client.request('/v1/sync',sync_manifest(args.manifest,args.generation))
         elif args.command=='scan':
             texts=[]
             for value in args.input:
