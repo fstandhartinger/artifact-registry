@@ -73,9 +73,10 @@ def diagnose(meta, events):
     end = stop['ts'] if stop else ev[-1]['ts']
     out['ended'] = out['ended'] or stop is not None
     out['duration_s'] = rel(end)
-    turns = []; calls = {}; muted_at = None; markers = set(); no_answer_at = []; cost_sum = 0.0; cost_seen = False; stop_cost = None
+    turns = []; calls = {}; muted_at = None; markers = set(); no_answer_at = []; superseded = []; cost_sum = 0.0; cost_seen = False; stop_cost = None
     for e in ev:
         t, d = e['type'], e['data']
+        if t == 'turn.user.grown' and isinstance(d.get('text'), str): superseded.append(d['text'])
         if t in ('turn.user.start', 'transcript.user.final'):
             n = e['turn']
             cur = next((x for x in reversed(turns) if n is not None and x['turn'] == n), None)
@@ -84,6 +85,7 @@ def diagnose(meta, events):
             if cur is None:
                 cur = {'turn': n, 'at': e['ts'], 'question': None, 'answer_at': None}; turns.append(cur)
             if t == 'transcript.user.final' and _text(e): cur['question'] = _text(e)
+            if d.get('marker') or (cur['question'] or '').startswith('[Markierung]'): cur['marker'] = True
         elif t == 'transcript.assistant.final' and _text(e) and turns:
             cur = next((x for x in reversed(turns) if e['turn'] is not None and x['turn'] == e['turn']), turns[-1])
             if cur['answer_at'] is None: cur['answer_at'] = e['ts']
@@ -115,6 +117,17 @@ def diagnose(meta, events):
     out['mute_s'] = round(out['mute_s'], 1)
     out['cost_usd'] = stop_cost if stop_cost is not None else (round(cost_sum, 4) if cost_seen else None)
     ended = out['ended']
+    # One sentence the vendor delivered in growing fragments is one question, and a drawn marking is context, not a question (a#7f54a5).
+    # Since gateway v0.1.5 a grown fragment keeps its turn id, so the last transcript is the question; older traces gave every fragment a new turn.
+    words = lambda t: re.sub(r'[^\w ]', ' ', t.lower()).split()
+    same = lambda a, b: bool(words(a)) and words(b)[:len(words(a))] == words(a)
+    out['markings'] = sum(1 for x in turns if x.get('marker'))
+    # A marking counts as seen when anything was said after it (he often goes on talking while he draws). With no answer after it, it stays a finding: that was the bug in a#7f54a5.
+    last_answer = max((x['answer_at'] for x in turns if x['answer_at'] is not None), default=None)
+    spoken = [x for x in turns if not x.get('marker')]
+    grown = {id(x) for x, nxt in zip(spoken, spoken[1:]) if x['answer_at'] is None and x['question'] and nxt['question'] and same(x['question'], nxt['question'])}
+    grown |= {id(x) for x in spoken if x['answer_at'] is None and x['question'] and words(x['question']) in [words(t) for t in superseded]}
+    turns = [x for x in turns if id(x) not in grown and not (x.get('marker') and last_answer is not None and last_answer >= x['at'])]
     for i, x in enumerate(turns):
         last = i == len(turns)-1
         window_end = x['answer_at'] or (end if last else turns[i+1]['at'])

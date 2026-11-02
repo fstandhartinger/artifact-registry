@@ -1,9 +1,48 @@
+#!/usr/bin/env python3
 """Read a Desk session trace from the artifact registry: meta, diagnosis, compact timeline."""
 import argparse
 import json
 import sys
 from datetime import datetime
-from artifact_cli import Client
+import os
+import re
+import shlex
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# This one file is the whole tool: it runs as a symlink or as a plain copy in ~/bin, with no module beside it (ModuleNotFoundError on Sandy, 2 Nov).
+class Client:
+    def __init__(self):
+        values = {}
+        path = Path.home()/'.config/dev-secrets.env'
+        if path.exists():
+            for line in path.read_text().splitlines():
+                match = re.match(r'^(?:export\s+)?(ARTIFACTS_[A-Z_]+)=(.*)$', line)
+                if match:
+                    try:
+                        parts = shlex.split(match[2], comments=True)
+                        if len(parts) == 1: values[match[1]] = parts[0]
+                    except ValueError: pass
+        values.update({k: v for k, v in os.environ.items() if k.startswith('ARTIFACTS_')})
+        self.url = values.get('ARTIFACTS_URL', 'https://artifacts.app.mintapis.com').rstrip('/')
+        self.token = values.get('ARTIFACTS_AGENT_TOKEN', '')
+        parsed = urllib.parse.urlsplit(self.url)
+        if parsed.scheme not in {'https', 'http'} or (parsed.scheme == 'http' and parsed.hostname not in {'localhost', '127.0.0.1', '::1'}):
+            raise ValueError('registry URL requires HTTPS except on loopback')
+    def request(self, path, **query):
+        url = self.url+path+('?'+urllib.parse.urlencode(query) if query else '')
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs): return None
+        req = urllib.request.Request(url, headers={'Authorization': 'Bearer '+self.token, 'Accept': 'application/json'})
+        try:
+            with urllib.request.build_opener(NoRedirect).open(req, timeout=10) as response: return json.load(response)
+        except urllib.error.HTTPError as e:
+            try: message = json.load(e).get('error', 'request refused')
+            except (ValueError, AttributeError): message = 'request refused'
+            raise ValueError(f'registry HTTP {e.code}: {message}') from None
+        except (urllib.error.URLError, TimeoutError): raise ValueError('registry unavailable') from None
 
 def say(data):
     if isinstance(data, dict):

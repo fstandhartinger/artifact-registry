@@ -1,3 +1,5 @@
+import shutil
+import tempfile
 import contextlib
 import hashlib
 import io
@@ -634,6 +636,35 @@ class RegistryTests(unittest.TestCase):
         for q,want in (('a#'+first,first),(first,first),('test-slug',first),('last',second),('other',second)):
             self.assertEqual(self.request('/v1/sessions/lookup?q='+urllib.parse.quote(q),token='reader')[1]['id'],'a#'+want,q)
         self.assertEqual(self.request('/v1/sessions/lookup?q=nope',token='reader')[0],404)
+    def test_growing_fragments_and_a_marking_are_no_unanswered_questions(self):
+        import datetime as dt, sessions as S
+        t0 = dt.datetime(2026,11,2,15,17,tzinfo=dt.timezone.utc)
+        def ev(sec, seq, type_, at_turn, **data): return {'ts': t0+dt.timedelta(seconds=sec), 'seq': seq, 'source': 'gateway', 'turn': at_turn, 'type': type_, 'data': data}
+        a = 'Nein, wir nehmen dieses Protokoll jetzt auf, weil wir'
+        b = a+' eine Fehlerbehebung vornehmen müssen, damit all diese'
+        events = [ev(0,1,'turn.user.start',5), ev(0,2,'transcript.user.final',5,text=a), ev(4,3,'turn.user.start',6), ev(4,4,'transcript.user.final',6,text=b),
+            ev(7,5,'turn.user.start',7), ev(7,6,'transcript.user.final',7,text=b+' Dinge besser funktionieren in Zukunft.'), ev(9,7,'transcript.assistant.final',7,text='Verstanden.'),
+            ev(36,8,'turn.user.start',8), ev(36,9,'transcript.user.final',8,text='[Markierung] Ich habe auf dem Bildschirm etwas markiert.',typed=True), ev(38,10,'turn.user.start',9),
+            ev(38,11,'transcript.user.final',9,text='Was passiert beim Zeichnen?'), ev(38.5,12,'transcript.assistant.final',9,text='Du hast einen Kreis gezeichnet.'), ev(50,13,'session.stop',None,reason='client-stop')]
+        d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, events)
+        self.assertEqual(d['unanswered'], []); self.assertFalse(d['flagged']); self.assertEqual([x['turn'] for x in d['turns']], [7,9]); self.assertEqual(d['markings'], 1)
+        # A marking with nothing said after it stays a finding.
+        d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, events[:9]+[ev(50,13,'session.stop',None)])
+        self.assertEqual([x['turn'] for x in d['unanswered']], [8]); self.assertTrue(d['flagged'])
+        # A question that really stayed without answer is still flagged, grown or not.
+        d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, events[:6]+[ev(30,7,'session.stop',None)])
+        self.assertEqual([x['turn'] for x in d['unanswered']], [7]); self.assertTrue(d['flagged'])
+        # Gateway v0.1.5: a grown fragment keeps its turn id; the last transcript is the question, and it can still stay unanswered.
+        grown = [ev(0,1,'turn.user.start',1), ev(0,2,'transcript.user.final',1,text='Erst das'), ev(1,3,'turn.user.grown',1,turn=1,text='Erst das'), ev(1,4,'transcript.user.final',1,text='Erst das und dann mehr')]
+        d = S.diagnose({'id':'a#1','kind':'voice'}, grown+[ev(3,5,'transcript.assistant.final',1,text='Ja.'), ev(9,6,'session.stop',None)])
+        self.assertEqual(d['unanswered'], []); self.assertEqual(d['turns'][0]['question'], 'Erst das und dann mehr')
+        d = S.diagnose({'id':'a#1','kind':'voice'}, grown+[ev(9,6,'session.stop',None)])
+        self.assertEqual([x['question'] for x in d['unanswered']], ['Erst das und dann mehr'])
+    def test_desk_trace_is_one_copyable_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td)/'desk-trace'; shutil.copyfile(Path(__file__).parents[1]/'bin/desk-trace', copy); copy.chmod(0o755)
+            run = subprocess.run([sys.executable, '-I', str(copy), '--help'], capture_output=True, text=True, cwd=td, env={'HOME': td})
+            self.assertEqual(run.returncode, 0, run.stderr); self.assertIn('desk-trace', run.stdout)
     def test_incident_is_flagged_and_diagnosed(self):
         sid=self.new_session()
         self.assertEqual(self.request(f'/v1/sessions/{sid}/events',self.events(self.INCIDENT),token='desk')[0],200)
