@@ -118,11 +118,14 @@ def diagnose(meta, events):
     ended = out['ended']
     # One sentence the vendor delivered in growing fragments is one question, and a drawn marking is context, not a question (a#7f54a5).
     # Since gateway v0.1.5 a grown fragment keeps its turn id, so the last transcript is the question; older traces gave every fragment a new turn.
-    same = lambda a, b: ' '.join(b.split()).startswith(' '.join(a.rstrip(' .,?!').split()))
+    words = lambda t: re.sub(r'[^\w ]', ' ', t.lower()).split()
+    same = lambda a, b: bool(words(a)) and words(b)[:len(words(a))] == words(a)
     out['markings'] = sum(1 for x in turns if x.get('marker'))
-    # A marking the agent did answer is no question; one it did not answer stays a finding, that was the bug in a#7f54a5.
-    turns = [x for i, x in enumerate(turns) if not (x.get('marker') and x['answer_at'] is not None) and not (
-        x['answer_at'] is None and not x.get('marker') and x['question'] and i+1 < len(turns) and turns[i+1]['question'] and same(x['question'], turns[i+1]['question']))]
+    # A marking counts as seen when anything was said after it (he often goes on talking while he draws). With no answer after it, it stays a finding: that was the bug in a#7f54a5.
+    last_answer = max((x['answer_at'] for x in turns if x['answer_at'] is not None), default=None)
+    spoken = [x for x in turns if not x.get('marker')]
+    grown = {id(x) for x, nxt in zip(spoken, spoken[1:]) if x['answer_at'] is None and x['question'] and nxt['question'] and same(x['question'], nxt['question'])}
+    turns = [x for x in turns if id(x) not in grown and not (x.get('marker') and last_answer is not None and last_answer >= x['at'])]
     for i, x in enumerate(turns):
         last = i == len(turns)-1
         window_end = x['answer_at'] or (end if last else turns[i+1]['at'])
