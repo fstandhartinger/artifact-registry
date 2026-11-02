@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -587,7 +588,8 @@ class RegistryTests(unittest.TestCase):
     INCIDENT=[(0,'session.start',None,{'provider':'openai'}),(3.2,'turn.user.start',1,{}),(3.5,'transcript.user.final',1,{'text':'Was weißt du über TNG?'}),
               (4,'tool.call',1,{'name':'knowledge_read','call_id':'c1','args':{'q':'TNG'}}),(45,'tool.stale',1,{'call_id':'c1','age_s':41}),
               (60,'barge_in',1,{}),(120,'barge_in',1,{}),(180,'barge_in',1,{}),(306,'session.stop',None,{'cost_usd':1.53})]
-    def events(self,rows,start=0,base=1700000000):
+    def events(self,rows,start=0,base=None):
+        base=int(time.time())-600 if base is None else base
         return {'events':[{'seq':start+n,'ts':base+t,'source':'gateway','turn':turn,'type':kind,'data':data} for n,(t,kind,turn,data) in enumerate(rows)]}
     def new_session(self,**extra):
         status,row=self.request('/v1/sessions',dict({'kind':'voice','provider':'openai','slug':'Test-Slug','page_aid':'card 7'},**extra),token='desk')
@@ -642,8 +644,14 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(d['cost_usd'],1.53); self.assertEqual(d['duration_s'],306)
         for word in ('USD 1.53','knowledge_read','Stille','ohne Antwort'): self.assertIn(word,d['what_happened'])
         self.assertLessEqual(len(d['what_happened'].splitlines()),5)
-        meta=res['session']; self.assertTrue(meta['flagged']); self.assertIn('TNG',meta['flag_reason']); self.assertIsNotNone(meta['ended_at'])
+        meta=res['session']; self.assertTrue(meta['flagged']); self.assertNotIn('TNG',meta['flag_reason']); self.assertIsNotNone(meta['ended_at'])
         item=self.request('/v1/resolve?ids='+sid,token='reader')[1]['items'][0]; self.assertIn('unbeantwortet',item['summary'])
+    def test_foreign_clock_is_clamped(self):
+        sid=self.new_session()
+        far=int(time.time())+10**7
+        self.request(f'/v1/sessions/{sid}/events',self.events([(0,'client.clock',None,{})],base=far),token='desk')
+        row=self.request(f'/v1/sessions/{sid}/trace',token='reader')[1]['events'][0]
+        self.assertLess(datetime.fromisoformat(row['ts'].replace('Z','+00:00')).timestamp(),time.time()+60)
     def test_gateway_create_body_and_real_event_names(self):
         # exactly what agent-desk gateway/src/trace.js sends (critic M1: the mocks on both sides hid a 422 on every session)
         body={'kind':'voice','provider':'openai','model':'gpt-live-1','slug':'demo','title':'Demo','page_aid':None,'card':None,'element':None,
@@ -687,7 +695,7 @@ class RegistryTests(unittest.TestCase):
             with patch.dict('os.environ',{'ARTIFACTS_DATABASE_URL':self.dsn,'NOTIFY':str(notify)}):
                 self.assertEqual(flags.main(),0); self.assertEqual(flags.main(),0)
             lines=log.read_text().splitlines()
-            self.assertEqual(len(lines),1); self.assertTrue(lines[0].startswith('digest desk-trace a#'+sid)); self.assertIn('TNG',lines[0])
+            self.assertEqual(len(lines),1); self.assertTrue(lines[0].startswith('digest desk-trace a#'+sid)); self.assertNotIn('TNG',lines[0])
     def test_retention_keeps_artifact_retired(self):
         sid=self.new_session()
         self.request(f'/v1/sessions/{sid}/events',self.events(self.INCIDENT[:3],base=int(time.time())),token='desk')
