@@ -73,10 +73,9 @@ def diagnose(meta, events):
     end = stop['ts'] if stop else ev[-1]['ts']
     out['ended'] = out['ended'] or stop is not None
     out['duration_s'] = rel(end)
-    turns = []; calls = {}; muted_at = None; markers = set(); no_answer_at = []; grown = set(); cost_sum = 0.0; cost_seen = False; stop_cost = None
+    turns = []; calls = {}; muted_at = None; markers = set(); no_answer_at = []; cost_sum = 0.0; cost_seen = False; stop_cost = None
     for e in ev:
         t, d = e['type'], e['data']
-        if t == 'turn.user.grown': grown.add(d.get('turn', e['turn']))
         if t in ('turn.user.start', 'transcript.user.final'):
             n = e['turn']
             cur = next((x for x in reversed(turns) if n is not None and x['turn'] == n), None)
@@ -118,9 +117,10 @@ def diagnose(meta, events):
     out['cost_usd'] = stop_cost if stop_cost is not None else (round(cost_sum, 4) if cost_seen else None)
     ended = out['ended']
     # One sentence the vendor delivered in growing fragments is one question, and a drawn marking is context, not a question (a#7f54a5).
+    # Since gateway v0.1.5 a grown fragment keeps its turn id, so the last transcript is the question; older traces gave every fragment a new turn.
     same = lambda a, b: ' '.join(b.split()).startswith(' '.join(a.rstrip(' .,?!').split()))
     out['markings'] = sum(1 for x in turns if x.get('marker'))
-    turns = [x for i, x in enumerate(turns) if not x.get('marker') and x['turn'] not in grown and not (
+    turns = [x for i, x in enumerate(turns) if not x.get('marker') and not (
         x['answer_at'] is None and x['question'] and i+1 < len(turns) and turns[i+1]['question'] and same(x['question'], turns[i+1]['question']))]
     for i, x in enumerate(turns):
         last = i == len(turns)-1

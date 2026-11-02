@@ -651,9 +651,12 @@ class RegistryTests(unittest.TestCase):
         # A question that really stayed without answer is still flagged, grown or not.
         d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, events[:6]+[ev(30,7,'session.stop',None)])
         self.assertEqual([x['turn'] for x in d['unanswered']], [7]); self.assertTrue(d['flagged'])
-        # The new gateway says so itself.
-        d = S.diagnose({'id':'a#1','kind':'voice'}, [ev(0,1,'turn.user.start',1), ev(0,2,'transcript.user.final',1,text='Erst das'), ev(1,3,'turn.user.grown',1,turn=1), ev(2,4,'turn.user.start',2), ev(2,5,'transcript.user.final',2,text='Ganz andere Worte'), ev(3,6,'transcript.assistant.final',2,text='Ja.'), ev(9,7,'session.stop',None)])
-        self.assertEqual(d['unanswered'], [])
+        # Gateway v0.1.5: a grown fragment keeps its turn id; the last transcript is the question, and it can still stay unanswered.
+        grown = [ev(0,1,'turn.user.start',1), ev(0,2,'transcript.user.final',1,text='Erst das'), ev(1,3,'turn.user.grown',1,turn=1,text='Erst das'), ev(1,4,'transcript.user.final',1,text='Erst das und dann mehr')]
+        d = S.diagnose({'id':'a#1','kind':'voice'}, grown+[ev(3,5,'transcript.assistant.final',1,text='Ja.'), ev(9,6,'session.stop',None)])
+        self.assertEqual(d['unanswered'], []); self.assertEqual(d['turns'][0]['question'], 'Erst das und dann mehr')
+        d = S.diagnose({'id':'a#1','kind':'voice'}, grown+[ev(9,6,'session.stop',None)])
+        self.assertEqual([x['question'] for x in d['unanswered']], ['Erst das und dann mehr'])
     def test_desk_trace_is_one_copyable_file(self):
         with tempfile.TemporaryDirectory() as td:
             copy = Path(td)/'desk-trace'; shutil.copyfile(Path(__file__).parents[1]/'bin/desk-trace', copy); copy.chmod(0o755)
