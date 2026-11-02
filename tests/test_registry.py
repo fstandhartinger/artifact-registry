@@ -644,6 +644,16 @@ class RegistryTests(unittest.TestCase):
         self.assertLessEqual(len(d['what_happened'].splitlines()),5)
         meta=res['session']; self.assertTrue(meta['flagged']); self.assertIn('TNG',meta['flag_reason']); self.assertIsNotNone(meta['ended_at'])
         item=self.request('/v1/resolve?ids='+sid,token='reader')[1]['items'][0]; self.assertIn('unbeantwortet',item['summary'])
+    def test_gateway_create_body_and_real_event_names(self):
+        # exactly what agent-desk gateway/src/trace.js sends (critic M1: the mocks on both sides hid a 422 on every session)
+        body={'kind':'voice','provider':'openai','model':'gpt-live-1','slug':'demo','title':'Demo','page_aid':None,'card':None,'element':None,
+              'entry':{'path':'card>interactive>desk','page_aid':None,'card':None,'element':None},'device':'phone',
+              'client':{'app':'web','version':'1','commit':'abc'},'screen_ids':['a#'+'0'*6]*20,'gateway_commit':'abc'}
+        status,row=self.request('/v1/sessions',body,token='desk'); self.assertEqual(status,200,row); sid=row['id']
+        rows=[(0,'session.start',None,{}),(1,'transcript.user.final',1,{'text':'Frage geheim?'}),(9,'session.stop',None,{'costUsd':1.53,'reason':'client-stop'})]
+        self.request(f'/v1/sessions/{sid}/events',self.events(rows),token='desk')
+        d=self.request(f'/v1/sessions/{sid}/diagnosis',token='reader')[1]['diagnosis']
+        self.assertEqual(d['cost_usd'],1.53); self.assertTrue(d['flagged']); self.assertNotIn('geheim',d['flag_reason'])
     def test_answered_session_is_not_flagged(self):
         sid=self.new_session()
         rows=[(0,'session.start',None,{}),(1,'transcript.user.final',1,{'text':'Hallo'}),(3,'transcript.assistant.final',1,{'text':'Hi!'}),

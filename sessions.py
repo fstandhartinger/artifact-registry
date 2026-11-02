@@ -1,6 +1,6 @@
 """Pure helpers for the session trace store: event scrubbing and diagnosis. No database access."""
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 MAX_EVENT_BYTES = 16 * 1024
 MAX_BATCH = 500
@@ -13,6 +13,10 @@ def blob_field(key, item):
 BLOB_VALUE = re.compile(r'[A-Za-z0-9+/_=-]{1024,}')
 PROGRESS = {'transcript.assistant.final','transcript.assistant.delta','tool.done','tool.result_sent'}
 MONTHS = ['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez']
+
+def clamp_ts(ts, now, back=timedelta(days=1), ahead=timedelta(minutes=5)):
+    """A foreign clock must not decide retention."""
+    return now if ts > now+ahead or ts < now-back else ts
 
 def parse_ts(value):
     if isinstance(value, bool): raise ValueError('bad ts')
@@ -37,7 +41,7 @@ def scrub(value, secret, depth=0):
     if isinstance(value, dict):
         out = {}; dropped = False
         for key, item in value.items():
-            key = str(key)[:100]
+            key = secret.sub('[REDACTED]', str(key))[:100]
             if blob_field(key, item) or (isinstance(item, str) and BLOB_VALUE.search(item)):
                 dropped = True; continue
             out[key], d = scrub(item, secret, depth+1); dropped |= d
@@ -100,10 +104,10 @@ def diagnose(meta, events):
         elif t == 'mic.unmute' and muted_at is not None:
             out['mute_s'] += (e['ts']-muted_at).total_seconds(); muted_at = None
         elif t.startswith('screen.frame'):
-            state = t.split('.', 2)[2] if t.count('.') >= 2 else str(d.get('status') or d.get('result') or d.get('state') or ('masked' if d.get('masked') else 'other'))
+            state = t.split('.', 2)[2] if t.count('.') >= 2 else str(d.get('decision') or d.get('status') or d.get('result') or d.get('state') or ('sent' if d.get('reason') else 'other'))
             state = {'dedup': 'deduped', 'duplicate': 'deduped', 'skip': 'skipped'}.get(state, state)
             out['frames'][state] = out['frames'].get(state, 0)+1
-        c = _num(d.get('cost_usd', d.get('cost')))
+        c = _num(d.get('cost_usd', d.get('costUsd', d.get('cost'))))
         if c is not None:
             if t == 'session.stop': stop_cost = c
             elif t == 'response.done': cost_sum += c; cost_seen = True
@@ -125,8 +129,7 @@ def diagnose(meta, events):
                 out['silent_gaps'].append({'turn': x['turn'], 'from_s': rel(a), 'to_s': rel(b), 'seconds': round((b-a).total_seconds(), 1), 'question_waiting': True, 'answered': answered})
     reasons = []
     if out['unanswered']:
-        first = out['unanswered'][0]; q = (first['question'] or 'ohne Transkript')[:50]
-        reasons.append(f"Frage ohne Antwort: „{q}“" + (f" (+{len(out['unanswered'])-1} weitere)" if len(out['unanswered']) > 1 else ''))
+        reasons.append(f"{len(out['unanswered'])} Frage(n) ohne Antwort")  # no question text: this line goes to the board digest and outlives the trace
     if out['unanswered'] and out['stale']: reasons.append('Ergebnis veraltet' + (f" ({out['stale'][0]['tool']})" if out['stale'][0]['tool'] else ''))
     if out['unanswered'] and out['silent_gaps']: reasons.append(f"Stille {int(max(g['seconds'] for g in out['silent_gaps']))} s")
     out['flagged'] = bool(out['unanswered']); out['flag_reason'] = '; '.join(reasons)[:300] if reasons else None

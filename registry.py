@@ -463,7 +463,7 @@ def session_ingest(db, aid, b, actor, token):
             if not isinstance(source,str) or not re.fullmatch(r'[a-z0-9._-]{1,40}',source) or not isinstance(etype,str) or not re.fullmatch(r'[a-z][a-z0-9._-]{0,59}',etype): raise ValueError
             if data is None: data = {}
             if not isinstance(data,dict): raise ValueError
-            ts = S.parse_ts(event['ts'])
+            ts = S.clamp_ts(S.parse_ts(event['ts']),datetime.now(timezone.utc))
         except (ValueError,KeyError,TypeError,OverflowError,OSError): fail(f'invalid event at index {n}')
         data,was_dropped = S.scrub(data,SECRET)
         size = len(json.dumps(data,ensure_ascii=False).encode())
