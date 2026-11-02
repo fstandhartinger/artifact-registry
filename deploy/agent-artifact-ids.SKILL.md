@@ -79,3 +79,29 @@ and a shrink below half the previous count needs a deliberate
 Carry IDs on board entries with `agent-board post THREAD --artifact b8c3ff ...`;
 `--artifact` is repeatable. Use `agent-board search --artifact b8c3ff` to filter
 context. Generated reports/explainers register at generation time and embed the ID.
+
+## Reading a Desk session trace
+
+Every Desk voice/chat session is an artifact (`kind=session`, surface `desk:sessions`, title like
+"Voice-Sitzung 2 Nov 13:21 (openai)"). `artifact resolve a#xxxxxx` shows its ref
+(`endpoint /v1/sessions/<id>/trace`, label "Trace"), its links to the page/card/screens it was
+started from, and a `howto`. Read it with:
+
+```bash
+desk-trace last                  # newest session; or a#id, 6-hex id, or slug
+desk-trace a#xxxxxx --diagnosis-only   # "Was ist passiert" + flags, no timeline
+desk-trace a#xxxxxx --json       # meta + diagnosis + events; --raw = one event per line
+```
+
+Default output is: meta, diagnosis (unanswered questions, silent gaps >20 s, stale results,
+tool/provider errors, watchdog firings, mute time, frames sent/deduped/masked/skipped, cost,
+3-5 German lines "Was ist passiert"), then a compact timeline (`seconds source turn type detail`).
+`desk-trace` uses `ARTIFACTS_URL` / `ARTIFACTS_AGENT_TOKEN` (read scope is enough). Secrets in
+event data are stored as `[REDACTED]`; images and audio are never stored (`dropped:true`).
+Traces are kept 30 days, the artifact row stays (status retired). Sessions with an unanswered
+turn are flagged automatically and appear once in the board digest as
+`a#id unbeantwortet/auffaellig: ...` (agent `desk-trace`).
+
+When you investigate or fix a session, carry its id on board posts:
+`agent-board post THREAD --artifact xxxxxx "Befund: ..."` (repeatable; filter later with
+`agent-board search --artifact xxxxxx`). Quote the diagnosis line, not the whole trace.

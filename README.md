@@ -382,3 +382,24 @@ are stored or returned; callers provide HMAC-SHA256 hashes.
 
 The integration test applies migration 003 twice in its owned throwaway database and checks
 device scope, create/list/verify, last_seen throttling, expiry/revoke and learned-only deletion.
+
+## Session traces (migration 004)
+
+Apply `migrations/004_sessions.sql` after 001-003 as the database owner (idempotent, one
+transaction): `psql "$ARTIFACTS_DATABASE_URL" -f migrations/004_sessions.sql`. It creates
+`session_meta`, append-only `session_trace` (UPDATE always refused; DELETE only inside
+`session_trace_retention(days)`), grants scope `trace` to the token named `desk`, and adds the
+retention function. Deploy the new `sessions.py` with `registry.py` (the Dockerfile copies it).
+Token caches last 60 s. Reading needs `read` (desk and agent tokens); writing needs `trace` (desk
+only). Device credentials are not registry tokens and get 401 everywhere.
+
+- `POST /v1/sessions` `{kind:voice|chat,provider,model,slug,page_aid,card,element,entry,device,client,gateway_commit,screen_ids}` -> `{id}` (6 hex). Allocates an artifact (kind session, surface desk:sessions), ref `endpoint /v1/sessions/<id>/trace`, related links to resolvable page/card/element/screen ids (unknown ones are skipped).
+- `POST /v1/sessions/<id>/events` `{events:[{seq,ts,source,turn,type,data}]}` -> `{accepted,duplicates,dropped,truncated}`. Max 500 events per batch (413), body max 4 MB. ts = epoch s/ms or ISO. Idempotent on (session,source,seq). Secrets in any string become `[REDACTED]`; fields named image/audio/pcm/png/jpeg and base64 runs over 1 KB are dropped and the event gets `data.dropped=true`; event data over 16 KB is replaced by `{truncated:true,bytes:n}`. Unknown id: 404. `session.stop` sets `ended_at`; stop, `turn.unanswered` and `watchdog.no_answer` re-run the diagnosis, which flags the session and updates the artifact summary.
+- `GET /v1/sessions/<id>/trace[?source=&limit=]` -> `{session,count,events}`; `GET /v1/sessions/<id>/diagnosis` -> `{session,diagnosis}`; `GET /v1/sessions/lookup?q=<a#id|hex|slug|last>` -> session meta.
+
+Install on Sandy (user units, symlink the scripts first):
+`ln -sf <checkout>/bin/desk-trace ~/bin/desk-trace; ln -sf <checkout>/deploy/session-flags.py ~/bin/session-flags;`
+`cp deploy/session-flags.* deploy/session-trace-retention.* ~/.config/systemd/user/; systemctl --user daemon-reload;`
+`systemctl --user enable --now session-flags.timer session-trace-retention.timer`.
+Both units source `dev-secrets.env` (`ARTIFACTS_DATABASE_URL`, needs `psql`). The flag digest calls
+`~/bin/notify digest "desk-trace" "<a#id + reason>"` once per flagged session and sets `flag_sent_at`.
