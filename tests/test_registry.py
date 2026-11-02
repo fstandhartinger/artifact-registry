@@ -2,10 +2,13 @@ import contextlib
 import hashlib
 import io
 import json
+import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -21,7 +24,8 @@ from registry import Server
 class RegistryTests(unittest.TestCase):
     @classmethod
     def admin(cls,query):
-        result=subprocess.run(['sudo','-n','-u','postgres','psql','-X','-qAt','-v','ON_ERROR_STOP=1'],input=query,text=True,capture_output=True)
+        admin=os.environ.get('ARTIFACTS_TEST_PSQL')
+        result=subprocess.run(shlex.split(admin) if admin else ['sudo','-n','-u','postgres','psql','-X','-qAt','-v','ON_ERROR_STOP=1'],input=query,text=True,capture_output=True)
         if result.returncode: raise RuntimeError('test database admin failed')
         return result.stdout.strip()
     @classmethod
@@ -42,10 +46,12 @@ class RegistryTests(unittest.TestCase):
             assert db.execute("SELECT title FROM artifact WHERE id='ffffff'").fetchone()[0]=='Existing'
             assert db.execute("SELECT origin FROM artifact_ref WHERE artifact_id='ffffff'").fetchone()[0]=='agent'
             assert db.execute("SELECT artifact_id FROM artifact_alias WHERE alias='card:999'").fetchone()[0]=='ffffff'
-            for name,scopes in [('all',['read','write','dict','sync','timer','admin','devices']),('desk',['read','dict']),('writer',['write']),('reader',['read'])]:
+            for name,scopes in [('all',['read','write','dict','sync','timer','admin','devices','trace']),('desk',['read','dict']),('writer',['write']),('reader',['read'])]:
                 db.execute('INSERT INTO token(name,hash,scopes) VALUES(%s,%s,%s)',(name,hashlib.sha256(('test-'+name).encode()).hexdigest(),scopes))
             migration3=(Path(__file__).resolve().parents[1]/'migrations/003_devices.sql').read_text()
             db.execute(migration3); db.execute(migration3)
+            migration4=(Path(__file__).resolve().parents[1]/'migrations/004_sessions.sql').read_text()
+            db.execute(migration4); db.execute(migration4)
         cls.server=Server(('127.0.0.1',0),cls.dsn)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True); cls.thread.start()
         cls.base='http://127.0.0.1:'+str(cls.server.server_port)
@@ -57,7 +63,7 @@ class RegistryTests(unittest.TestCase):
         self.sha_patch=patch('registry.sha_missing',return_value=False)
         self.sha_patch.start(); self.addCleanup(self.sha_patch.stop)
         with psycopg.connect(self.dsn) as db:
-            db.execute('TRUNCATE device,artifact,artifact_alias,artifact_ref,artifact_link,sync_state,audit,dictionary CASCADE')
+            db.execute('TRUNCATE device,session_trace,session_meta,artifact,artifact_alias,artifact_ref,artifact_link,sync_state,audit,dictionary CASCADE')
     def request(self,path,body=None,token='all',method=None,raw=None):
         headers={'Content-Type':'application/json'}
         if token is not None: headers['Authorization']='Bearer test-'+token
@@ -577,5 +583,115 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(self.request('/v1/dictionary/Learned',token='reader',method='DELETE')[0],403)
         self.assertEqual(self.request('/v1/dictionary/Manual',token='desk',method='DELETE')[0],404)
         self.assertEqual(self.request('/v1/dictionary/Learned',token='desk',method='DELETE')[0],200)
+
+    INCIDENT=[(0,'session.start',None,{'provider':'openai'}),(3.2,'turn.user.start',1,{}),(3.5,'transcript.user.final',1,{'text':'Was weißt du über TNG?'}),
+              (4,'tool.call',1,{'name':'knowledge_read','call_id':'c1','args':{'q':'TNG'}}),(45,'tool.stale',1,{'call_id':'c1','age_s':41}),
+              (60,'barge_in',1,{}),(120,'barge_in',1,{}),(180,'barge_in',1,{}),(306,'session.stop',None,{'cost_usd':1.53})]
+    def events(self,rows,start=0,base=1700000000):
+        return {'events':[{'seq':start+n,'ts':base+t,'source':'gateway','turn':turn,'type':kind,'data':data} for n,(t,kind,turn,data) in enumerate(rows)]}
+    def new_session(self,**extra):
+        status,row=self.request('/v1/sessions',dict({'kind':'voice','provider':'openai','slug':'Test-Slug','page_aid':'card 7'},**extra),token='desk')
+        self.assertEqual(status,200); return row['id']
+    def test_session_trace_roundtrip_and_guards(self):
+        status,card=self.request('/v1/artifacts',{'kind':'card','title':'Karte','surface':'x','aliases':['card:7']})
+        sid=self.new_session()
+        status,res=self.request('/v1/resolve?ids='+sid,token='reader'); item=res['items'][0]
+        self.assertEqual((item['kind'],item['surface'],item['status']),('session','desk:sessions','active'))
+        self.assertRegex(item['title'],r'^Voice-Sitzung \d+ \w+ \d\d:\d\d \(openai\)$')
+        self.assertIn({'kind':'endpoint','target':f'/v1/sessions/{sid}/trace','label':'Trace','ord':0,'origin':'agent','pinned_sha':None},item['refs'])
+        self.assertIn('desk-trace a#'+sid,item['howto'])
+        self.assertEqual([l['to'] for l in item['links']],[card['id']])
+        # auth: desk writes, agent reads only, unknown/device bearer gets nothing
+        ev=self.events([(0,'session.start',None,{})])
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',ev,token='reader')[0],403)
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',ev,token='nobody')[0],401)
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/trace',token='nobody')[0],401)
+        self.assertEqual(self.request('/v1/sessions',{'kind':'voice','provider':'x'},token='reader')[0],403)
+        # redaction, blob dropping, idempotency, unknown id
+        key='sk-'+'a'*20
+        batch=self.events([(1,'transcript.user.final',1,{'text':'mein key '+key,'nested':[{'t':'Bearer abcdef12345'}]}),
+                           (2,'screen.frame',1,{'status':'sent','image':'x'*10,'png_b64':'A'*2000,'w':100}),
+                           (3,'client.big',1,{'note':'lang '*4000})],start=1)
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',batch,token='desk')[1],{'accepted':3,'duplicates':0,'dropped':1,'truncated':1})
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',batch,token='desk')[1]['duplicates'],3)
+        self.assertEqual(self.request('/v1/sessions/ffffff/events',ev,token='desk')[0],404)
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',{'events':[dict(ev['events'][0],ts='nonsense')]},token='desk')[0],422)
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',{'events':ev['events']*501},token='desk')[0],413)
+        status,trace=self.request(f'/v1/sessions/{sid}/trace',token='reader')
+        text=json.dumps(trace); self.assertNotIn(key,text); self.assertNotIn('abcdef12345',text); self.assertEqual(text.count('[REDACTED]'),2)
+        frame=[e for e in trace['events'] if e['type']=='screen.frame'][0]['data']
+        self.assertEqual(frame,{'status':'sent','w':100,'dropped':True})
+        self.assertEqual([e for e in trace['events'] if e['type']=='client.big'][0]['data'],{'truncated':True,'bytes':20012})
+        # append only
+        with psycopg.connect(self.dsn) as db:
+            for q in ("UPDATE session_trace SET type='x'","DELETE FROM session_trace"):
+                with self.assertRaises(psycopg.Error): db.execute(q)
+                db.rollback()
+    def test_lookup_variants(self):
+        first=self.new_session(); second=self.new_session(slug='other')
+        for q,want in (('a#'+first,first),(first,first),('test-slug',first),('last',second),('other',second)):
+            self.assertEqual(self.request('/v1/sessions/lookup?q='+urllib.parse.quote(q),token='reader')[1]['id'],'a#'+want,q)
+        self.assertEqual(self.request('/v1/sessions/lookup?q=nope',token='reader')[0],404)
+    def test_incident_is_flagged_and_diagnosed(self):
+        sid=self.new_session()
+        self.assertEqual(self.request(f'/v1/sessions/{sid}/events',self.events(self.INCIDENT),token='desk')[0],200)
+        status,res=self.request(f'/v1/sessions/{sid}/diagnosis',token='reader'); d=res['diagnosis']
+        self.assertTrue(d['flagged']); self.assertEqual(len(d['unanswered']),1); self.assertIn('TNG',d['unanswered'][0]['question'])
+        self.assertEqual(d['stale'][0]['tool'],'knowledge_read'); self.assertEqual(d['barge_ins'],3)
+        self.assertGreater(d['silent_gaps'][0]['seconds'],290)
+        self.assertEqual(d['cost_usd'],1.53); self.assertEqual(d['duration_s'],306)
+        for word in ('USD 1.53','knowledge_read','Stille','ohne Antwort'): self.assertIn(word,d['what_happened'])
+        self.assertLessEqual(len(d['what_happened'].splitlines()),5)
+        meta=res['session']; self.assertTrue(meta['flagged']); self.assertIn('TNG',meta['flag_reason']); self.assertIsNotNone(meta['ended_at'])
+        item=self.request('/v1/resolve?ids='+sid,token='reader')[1]['items'][0]; self.assertIn('unbeantwortet',item['summary'])
+    def test_answered_session_is_not_flagged(self):
+        sid=self.new_session()
+        rows=[(0,'session.start',None,{}),(1,'transcript.user.final',1,{'text':'Hallo'}),(3,'transcript.assistant.final',1,{'text':'Hi!'}),
+              (60,'turn.user.start',2,{}),(61,'transcript.user.final',2,{'text':'Und jetzt?'}),(63,'transcript.assistant.final',2,{'text':'Gern.'}),(70,'session.stop',None,{})]
+        self.request(f'/v1/sessions/{sid}/events',self.events(rows),token='desk')
+        d=self.request(f'/v1/sessions/{sid}/diagnosis',token='reader')[1]['diagnosis']
+        self.assertFalse(d['flagged']); self.assertEqual(d['unanswered'],[]); self.assertEqual(d['silent_gaps'],[])
+    def test_desk_trace_cli_and_flag_digest(self):
+        import desk_trace
+        sid=self.new_session()
+        self.request(f'/v1/sessions/{sid}/events',self.events(self.INCIDENT),token='desk')
+        env={'ARTIFACTS_URL':self.base,'ARTIFACTS_AGENT_TOKEN':'test-reader'}
+        def run(*args):
+            out=io.StringIO()
+            with patch.dict('os.environ',env), contextlib.redirect_stdout(out): code=desk_trace.main(list(args))
+            return code,''.join(l for l in out.getvalue().splitlines(True) if not l.startswith('{"method"'))
+        code,text=run('last'); self.assertEqual(code,0)
+        for word in ('a#'+sid,'Was ist passiert','Flag: JA','knowledge_read','tool.stale','barge_in','TNG'): self.assertIn(word,text)
+        self.assertLess(text.index('Was ist passiert'),text.index('Timeline:'))
+        code,text=run('test-slug','--diagnosis-only'); self.assertNotIn('Timeline:',text); self.assertIn('Flag: JA',text)
+        code,text=run(sid,'--json'); self.assertTrue(json.loads(text)['diagnosis']['flagged'])
+        code,text=run('a#'+sid,'--raw'); self.assertEqual(len(text.splitlines()),len(self.INCIDENT))
+        self.assertEqual(run('nope')[0],1)
+        # digest: one board line per flagged session, no repeats
+        import tempfile,importlib.util
+        with tempfile.TemporaryDirectory() as tmp:
+            notify=Path(tmp)/'notify'; log=Path(tmp)/'log'
+            notify.write_text('#!/bin/sh\necho "$@" >> '+str(log)+'\n'); notify.chmod(0o755)
+            spec=importlib.util.spec_from_file_location('session_flags',Path(__file__).resolve().parents[1]/'deploy/session-flags.py')
+            flags=importlib.util.module_from_spec(spec); spec.loader.exec_module(flags)
+            with patch.dict('os.environ',{'ARTIFACTS_DATABASE_URL':self.dsn,'NOTIFY':str(notify)}):
+                self.assertEqual(flags.main(),0); self.assertEqual(flags.main(),0)
+            lines=log.read_text().splitlines()
+            self.assertEqual(len(lines),1); self.assertTrue(lines[0].startswith('digest desk-trace a#'+sid)); self.assertIn('TNG',lines[0])
+    def test_retention_keeps_artifact_retired(self):
+        sid=self.new_session()
+        self.request(f'/v1/sessions/{sid}/events',self.events(self.INCIDENT[:3],base=int(time.time())),token='desk')
+        with psycopg.connect(self.dsn) as db:
+            db.execute("UPDATE session_meta SET started_at=now()-interval '40 days' WHERE session_id=%s",(sid,))
+            db.execute("ALTER TABLE session_trace DISABLE TRIGGER session_trace_guard")
+            db.execute("UPDATE session_trace SET ts=now()-interval '31 days' WHERE session_id=%s AND seq=0",(sid,))
+            db.execute("ALTER TABLE session_trace ENABLE TRIGGER session_trace_guard")
+            self.assertEqual(db.execute('SELECT session_trace_retention(30)').fetchone()[0],1)
+            self.assertEqual(db.execute('SELECT status FROM artifact WHERE id=%s',(sid,)).fetchone()[0],'active')
+            db.execute("ALTER TABLE session_trace DISABLE TRIGGER session_trace_guard")
+            db.execute("UPDATE session_trace SET ts=now()-interval '31 days' WHERE session_id=%s",(sid,))
+            db.execute("ALTER TABLE session_trace ENABLE TRIGGER session_trace_guard")
+            self.assertEqual(db.execute('SELECT session_trace_retention(30)').fetchone()[0],2)
+            self.assertEqual(db.execute('SELECT status FROM artifact WHERE id=%s',(sid,)).fetchone()[0],'retired')
 
 if __name__=='__main__': unittest.main()

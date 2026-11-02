@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit, unquote
 
@@ -22,10 +23,12 @@ from psycopg.types.json import Jsonb
 from psycopg import sql
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'bin'))
 from artifact_ids import normalise
+import sessions as S
 
 MAX_BODY = 256 * 1024
+MAX_EVENTS_BODY = 4 * 1024 * 1024
 BIP39_WORDS = frozenset((Path(__file__).parent/'data/bip39-english.txt').read_text().splitlines())
-KINDS = {'app','page','panel','element','card','explainer','scene','diagram','doc','job','tweet','board-entry','finance'}
+KINDS = {'app','page','panel','element','card','explainer','scene','diagram','doc','job','tweet','board-entry','finance','session'}
 REF_KINDS = {'code','repo','file','board','decision','readme','doc','endpoint','url','job','card','explainer','artifact'}
 SECRET = re.compile(r'(?i)(?:\b(?:sk-|(?:ghp|github_pat|gho|art|hf)_|xox[baprs]-)[a-z0-9_-]{8,}|\bAKIA[A-Z0-9]{16}\b|\bbearer\s+\S+|\beyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret[_ -]?key)\s*[:=]\s*\S+|\b(?:seed phrase|recovery phrase|mnemonic)\b)')
 # IBAN: uppercase country code + check digits + 11-30 alphanumerics in optional groups of 4, digit-heavy.
@@ -296,6 +299,8 @@ def resolve(db,row,deadline=None,depth=0):
             frontier=next_frontier
         row['linked_nodes']=nodes
     if row.get('superseded_by'): row['superseded_by']='a#'+row['superseded_by']
+    if row['kind']=='session':
+        row['howto']=f"Trace lesen: desk-trace a#{aid} (--json, --raw, --diagnosis-only) oder GET /v1/sessions/{aid}/trace und /diagnosis mit dem Agent-Token. Board-Beitraege mit --artifact a#{aid} verknuepfen."
     row['stale'] = bool(row.get('stale_reason')) or row['stale'] or any(sha_missing(ref,deadline or time.monotonic()+2) for ref in row['refs'])
     return row
 
@@ -381,6 +386,125 @@ def sync(db,b,actor,token=None):
     audit(db,actor,'sync',detail={'count':len(ids),'retired':len(retired)})
     return {'ids':['a#'+i for i in ids],'retired':['a#'+r['id'] for r in retired]}
 
+SESSION_ID = re.compile(r'/v1/sessions/([0-9a-f]{6})/(trace|diagnosis|events)')
+SLUG = re.compile(r'[\w .:/@#+-]{1,200}')
+
+def session_row(db, aid, lock=False):
+    row = db.execute("SELECT m.*,a.title,a.status FROM session_meta m JOIN artifact a ON a.id=m.session_id WHERE m.session_id=%s"+(' FOR UPDATE OF m' if lock else ''),(aid,)).fetchone()
+    if not row: fail('session not found',404)
+    return row
+
+def session_public(row):
+    row = dict(row); row['id'] = 'a#'+row.pop('session_id')
+    return row
+
+def session_events(db, aid, limit=20000, source=None):
+    return db.execute("SELECT seq,ts,source,turn,type,data FROM session_trace WHERE session_id=%s"+(" AND source=%s" if source else "")+" ORDER BY ts,source,seq LIMIT %s",(aid,)+((source,) if source else ())+(limit,)).fetchall()
+
+def session_refresh(db, aid):
+    """Recompute the diagnosis; flag unanswered sessions and keep the artifact summary current."""
+    meta = session_row(db,aid,lock=True)
+    diag = S.diagnose(dict(meta,id='a#'+aid),session_events(db,aid))
+    if diag['flagged'] and (not meta['flagged'] or (meta['flag_sent_at'] is None and meta['flag_reason']!=diag['flag_reason'])):
+        db.execute('UPDATE session_meta SET flagged=true,flag_reason=%s WHERE session_id=%s',(diag['flag_reason'],aid))
+    db.execute('UPDATE artifact SET summary=%s,updated_at=now() WHERE id=%s',(S.summary_for(diag)[:1200],aid))
+    return diag
+
+def local_time(moment):
+    try: return moment.astimezone(ZoneInfo('Europe/Berlin'))
+    except ZoneInfoNotFoundError: return moment
+
+def session_create(db, b, actor, token):
+    require_surface(token,'desk:sessions')
+    kind = b.get('kind')
+    if kind not in ('voice','chat'): fail('kind must be voice or chat')
+    provider = text_field(b.get('provider'),'provider',40,False)
+    if not re.fullmatch(r'[\w.-]+',provider): fail('invalid provider')
+    meta = {}
+    for name,limit in (('model',100),('slug',200),('device',200),('gateway_commit',64)):
+        value = b.get(name)
+        meta[name] = None if value is None else text_field(value,name,limit)
+    if meta['slug'] is not None and not SLUG.fullmatch(meta['slug']): fail('invalid slug')
+    for name in ('client','entry'):
+        value = b.get(name,{})
+        if not isinstance(value,dict) or len(json.dumps(value))>4096: fail(name+' must be a small object')
+        meta[name],_ = S.scrub(value,SECRET)
+    screens = b.get('screen_ids',[])
+    if not isinstance(screens,list) or len(screens)>20: fail('screen_ids must be an array of at most 20 ids')
+    now = datetime.now(timezone.utc)
+    aid = allocate(db,'desk:sessions',actor)
+    db.execute("UPDATE artifact SET kind='session',title=%s,status='active',access='private',updated_at=now() WHERE id=%s",(S.title_for(kind,provider,local_time(now)),aid))
+    db.execute('INSERT INTO session_meta(session_id,kind,provider,model,slug,device,client,entry,gateway_commit,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+               (aid,kind,provider,meta['model'],meta['slug'],meta['device'],Jsonb(meta['client']),Jsonb(meta['entry']),meta['gateway_commit'],now))
+    db.execute("INSERT INTO artifact_ref(artifact_id,kind,target,label,ord) VALUES(%s,'endpoint',%s,'Trace',0)",(aid,f'/v1/sessions/{aid}/trace'))
+    targets = [b.get('page_aid'),b.get('card'),b.get('element')]+screens
+    for value in targets:
+        if value in (None,'') or not isinstance(value,(str,int)): continue
+        try: row = lookup(db,str(value),reserved=True)
+        except APIError: row = None
+        if not row or row['id']==aid: continue
+        for src,dst in ((aid,row['id']),(row['id'],aid)):
+            db.execute("INSERT INTO artifact_link(src,dst,rel,created_by) VALUES(%s,%s,'related',%s) ON CONFLICT DO NOTHING",(src,dst,actor))
+    audit(db,actor,'session_create',aid)
+    return {'id':aid}
+
+def session_ingest(db, aid, b, actor, token):
+    require_surface(token,'desk:sessions')
+    session_row(db,aid)
+    events = b.get('events')
+    if not isinstance(events,list) or not events: fail('events must be a non-empty array')
+    if len(events)>S.MAX_BATCH: fail(f'at most {S.MAX_BATCH} events per batch',413)
+    rows = []; dropped = truncated = 0; kinds = set()
+    for n,event in enumerate(events):
+        try:
+            if not isinstance(event,dict) or set(event)-{'seq','ts','source','turn','type','data'}: raise ValueError
+            seq,turn,source,etype,data = event['seq'],event.get('turn'),event.get('source'),event.get('type'),event.get('data',{})
+            if type(seq) is not int or not 0<=seq<2**53 or (turn is not None and (type(turn) is not int or not 0<=turn<2**31)): raise ValueError
+            if not isinstance(source,str) or not re.fullmatch(r'[a-z0-9._-]{1,40}',source) or not isinstance(etype,str) or not re.fullmatch(r'[a-z][a-z0-9._-]{0,59}',etype): raise ValueError
+            if data is None: data = {}
+            if not isinstance(data,dict): raise ValueError
+            ts = S.parse_ts(event['ts'])
+        except (ValueError,KeyError,TypeError,OverflowError,OSError): fail(f'invalid event at index {n}')
+        data,was_dropped = S.scrub(data,SECRET)
+        size = len(json.dumps(data,ensure_ascii=False).encode())
+        if size>S.MAX_EVENT_BYTES: data = {'truncated':True,'bytes':size}; truncated += 1
+        if was_dropped: data['dropped'] = True; dropped += 1
+        rows.append((aid,seq,ts,source,turn,etype,Jsonb(data))); kinds.add(etype)
+    inserted = 0
+    with db.cursor() as cur:
+        for row in rows:
+            cur.execute('INSERT INTO session_trace(session_id,seq,ts,source,turn,type,data) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',row)
+            inserted += cur.rowcount
+    stops = [r[2] for r in rows if r[5]=='session.stop']
+    if stops: db.execute('UPDATE session_meta SET ended_at=%s WHERE session_id=%s AND ended_at IS NULL',(max(stops),aid))
+    if kinds & {'session.stop','turn.unanswered','watchdog.no_answer'}: session_refresh(db,aid)
+    return {'accepted':inserted,'duplicates':len(rows)-inserted,'dropped':dropped,'truncated':truncated}
+
+def session_api(db, command, path, q, b, actor, token):
+    if path=='/v1/sessions' and command=='POST': return session_create(db,b,actor,token)
+    if path=='/v1/sessions/lookup' and command=='GET':
+        value = text_field(q.get('q',[''])[0],'q',300,False).strip()
+        low = value.lower()
+        if low=='last': row = db.execute('SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1').fetchone()
+        else:
+            try: row = {'session_id':normalise(value)}
+            except ValueError: row = db.execute('SELECT session_id FROM session_meta WHERE lower(slug)=%s ORDER BY started_at DESC LIMIT 1',(low,)).fetchone()
+        if not row: fail('session not found',404)
+        return session_public(session_row(db,row['session_id']))
+    match = SESSION_ID.fullmatch(path)
+    if not match: fail('endpoint not found',404)
+    aid,what = match.groups()
+    if what=='events' and command=='POST': return session_ingest(db,aid,b,actor,token)
+    if command!='GET': fail('endpoint not found',404)
+    meta = session_row(db,aid)
+    if what=='trace':
+        try: limit = int(q.get('limit',['20000'])[0])
+        except ValueError: fail('limit must be an integer')
+        if not 1<=limit<=20000: fail('limit must be between 1 and 20000')
+        events = session_events(db,aid,limit,q.get('source',[None])[0])
+        return {'session':session_public(meta),'count':len(events),'events':events}
+    return {'session':session_public(meta),'diagnosis':S.diagnose(dict(meta,id='a#'+aid),session_events(db,aid))}
+
 class Handler(BaseHTTPRequestHandler):
     server_version='ArtifactRegistry/1'
     def log_message(self,*args): pass
@@ -442,14 +566,14 @@ class Handler(BaseHTTPRequestHandler):
             if not token: fail('invalid bearer token',401)
             self.token=token
             self.actor=token['name']
-            scope=('devices' if path=='/v1/devices' or path.startswith('/v1/devices/') else 'dict' if path.startswith('/v1/dictionary/') else 'admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
+            scope=('trace' if path.startswith('/v1/sessions') and self.command!='GET' else 'devices' if path=='/v1/devices' or path.startswith('/v1/devices/') else 'dict' if path.startswith('/v1/dictionary/') else 'admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
             if scope not in token['scopes']: fail('insufficient scope: '+scope,403)
             body={}
             if self.command!='GET':
                 if self.headers.get('Transfer-Encoding'): fail('transfer encoding not supported',400)
                 try: length=int(self.headers.get('Content-Length','0'))
                 except ValueError: fail('invalid content length',400)
-                if length<0 or length>MAX_BODY: fail('body exceeds 256 KB',413)
+                if length<0 or length>(MAX_EVENTS_BODY if path.endswith('/events') else MAX_BODY): fail('body too large',413)
                 try: body=json.loads(self.rfile.read(length)) if length else {}
                 except (ValueError,UnicodeError): fail('invalid JSON body',400)
                 if not isinstance(body,dict): fail('JSON body must be an object')
@@ -495,6 +619,7 @@ class Handler(BaseHTTPRequestHandler):
             if not row: fail('learned term not found',404)
             audit(db,actor,'dictionary_delete')
             return {'ok':True}
+        if path.startswith('/v1/sessions'): return session_api(db,self.command,path,q,b,actor,self.token)
         if self.command=='GET':
             if path in ('/v1/resolve','/v1/exists'):
                 ids=get('ids').split(',') if get('ids') else []
