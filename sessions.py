@@ -62,6 +62,12 @@ def _dur(seconds):
     seconds = int(round(seconds))
     return f'{seconds//60} min {seconds%60} s' if seconds >= 60 else f'{seconds} s'
 
+SUPERSEDE_S = 10
+TALKED_OVER_S = 5
+
+def _norm(text):
+    return re.sub(r'[\W_]+', ' ', (text or '').lower()).strip()
+
 def diagnose(meta, events):
     ev = sorted(events, key=lambda e: (e['ts'], e['seq']))
     out = {'session': meta.get('id'), 'events': len(ev), 'turns': [], 'unanswered': [], 'silent_gaps': [], 'stale': [], 'tool_errors': [],
@@ -120,8 +126,14 @@ def diagnose(meta, events):
         window_end = x['answer_at'] or (end if last else turns[i+1]['at'])
         answered = x['answer_at'] is not None
         row = {'turn': x['turn'], 'at_s': rel(x['at']), 'question': x['question'], 'answered': answered, 'answer_at_s': rel(x['answer_at']) if answered else None}
+        nxt = None if last else turns[i+1]
+        # A half sentence the vendor finalised early, or a turn Florian talked over at once and that got answered: one question, not an unanswered one (a#7f54a5).
+        if not answered and nxt is not None and x['turn'] not in markers and (nxt['at']-x['at']).total_seconds() <= SUPERSEDE_S and (
+                _norm(nxt['question']).startswith(_norm(x['question'])) and _norm(x['question'])
+                or (nxt['at']-x['at']).total_seconds() <= TALKED_OVER_S and nxt['answer_at'] is not None):
+            row['superseded'] = True
         out['turns'].append(row)
-        if not answered and (ended or not last or x['turn'] in markers or any(a >= x['at'] for a in no_answer_at)):
+        if not answered and not row.get('superseded') and (ended or not last or x['turn'] in markers or any(a >= x['at'] for a in no_answer_at)):
             out['unanswered'].append(row)
         points = [x['at']]+[e['ts'] for e in ev if e['type'] in PROGRESS and x['at'] < e['ts'] < window_end]+[window_end]
         for a, b in zip(points, points[1:]):
