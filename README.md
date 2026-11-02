@@ -397,9 +397,12 @@ only). Device credentials are not registry tokens and get 401 everywhere.
 - `POST /v1/sessions/<id>/events` `{events:[{seq,ts,source,turn,type,data}]}` -> `{accepted,duplicates,dropped,truncated}`. Max 500 events per batch (413), body max 4 MB. ts = epoch s/ms or ISO. Idempotent on (session,source,seq). Secrets in any string become `[REDACTED]`; fields named image/audio/pcm/png/jpeg and base64 runs over 1 KB are dropped and the event gets `data.dropped=true`; event data over 16 KB is replaced by `{truncated:true,bytes:n}`. Unknown id: 404. `session.stop` sets `ended_at`; stop, `turn.unanswered` and `watchdog.no_answer` re-run the diagnosis, which flags the session and updates the artifact summary.
 - `GET /v1/sessions/<id>/trace[?source=&limit=]` -> `{session,count,events}`; `GET /v1/sessions/<id>/diagnosis` -> `{session,diagnosis}`; `GET /v1/sessions/lookup?q=<a#id|hex|slug|last>` -> session meta.
 
-Install on Sandy (user units, symlink the scripts first):
-`ln -sf <checkout>/bin/desk-trace ~/bin/desk-trace; ln -sf <checkout>/deploy/session-flags.py ~/bin/session-flags;`
-`cp deploy/session-flags.* deploy/session-trace-retention.* ~/.config/systemd/user/; systemctl --user daemon-reload;`
-`systemctl --user enable --now session-flags.timer session-trace-retention.timer`.
-Both units source `dev-secrets.env` (`ARTIFACTS_DATABASE_URL`, needs `psql`). The flag digest calls
-`~/bin/notify digest "desk-trace" "<a#id + reason>"` once per flagged session and sets `flag_sent_at`.
+- `GET /v1/sessions/flags` (read) -> `{items:[{id,reason}]}` flagged sessions whose digest line is not sent yet; `POST /v1/sessions/flags/sent` `{ids:[...]}` (scope `sync`) -> `{marked}`.
+
+Housekeeping never touches the database from outside the service:
+- Retention runs inside the registry process: 5 min after start, then every 24 h, `session_trace_retention(30)`
+  (`ARTIFACTS_TRACE_RETENTION_DAYS`, 0 disables). Each run logs one JSON line `{"job":"session_trace_retention",...}`.
+- The flag digest on Sandy uses the API with `ARTIFACTS_AGENT_TOKEN` (read + sync), no `ARTIFACTS_DATABASE_URL`:
+  `ln -sf <checkout>/bin/desk-trace ~/bin/desk-trace; ln -sf <checkout>/deploy/session-flags.py ~/bin/session-flags;`
+  `cp deploy/session-flags.* ~/.config/systemd/user/; systemctl --user daemon-reload; systemctl --user enable --now session-flags.timer`.
+  It calls `~/bin/notify digest "desk-trace" "<a#id + reason>"` once per flagged session, then marks it sent.

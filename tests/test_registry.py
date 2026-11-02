@@ -692,8 +692,15 @@ class RegistryTests(unittest.TestCase):
             notify.write_text('#!/bin/sh\necho "$@" >> '+str(log)+'\n'); notify.chmod(0o755)
             spec=importlib.util.spec_from_file_location('session_flags',Path(__file__).resolve().parents[1]/'deploy/session-flags.py')
             flags=importlib.util.module_from_spec(spec); spec.loader.exec_module(flags)
-            with patch.dict('os.environ',{'ARTIFACTS_DATABASE_URL':self.dsn,'NOTIFY':str(notify)}):
+            # production agent token shape: read+write+dict+sync, no trace, no database access
+            with psycopg.connect(self.dsn) as db:
+                db.execute("INSERT INTO token(name,hash,scopes) VALUES('agentlike',%s,%s) ON CONFLICT DO NOTHING",(hashlib.sha256(b'test-agentlike').hexdigest(),['read','write','dict','sync']))
+            self.assertEqual(self.request('/v1/sessions/flags/sent',{'ids':[sid]},token='reader')[0],403)
+            self.assertEqual(self.request('/v1/sessions/flags/sent',{'ids':['zz']},token='all')[0],422)
+            with patch.dict('os.environ',{'ARTIFACTS_URL':self.base,'ARTIFACTS_AGENT_TOKEN':'test-agentlike','NOTIFY':str(notify)}):
+                os.environ.pop('ARTIFACTS_DATABASE_URL',None)
                 self.assertEqual(flags.main(),0); self.assertEqual(flags.main(),0)
+            self.assertEqual(self.request('/v1/sessions/flags',token='reader'),(200,{'items':[]}))
             lines=log.read_text().splitlines()
             self.assertEqual(len(lines),1); self.assertTrue(lines[0].startswith('digest desk-trace a#'+sid)); self.assertNotIn('TNG',lines[0])
     def test_retention_keeps_artifact_retired(self):
@@ -711,5 +718,15 @@ class RegistryTests(unittest.TestCase):
             db.execute("ALTER TABLE session_trace ENABLE TRIGGER session_trace_guard")
             self.assertEqual(db.execute('SELECT session_trace_retention(30)').fetchone()[0],2)
             self.assertEqual(db.execute('SELECT status FROM artifact WHERE id=%s',(sid,)).fetchone()[0],'retired')
+    def test_retention_loop_runs_in_service(self):
+        import registry
+        calls=[]
+        class Stop(Exception): pass
+        def sleep(n):
+            calls.append(n)
+            if len(calls)>1: raise Stop
+        with patch.object(registry.time,'sleep',sleep), contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(Stop): registry.trace_retention_loop(self.dsn,30,interval=7,first=0)
+        self.assertEqual(calls,[0,7]); self.assertIn('"removed": 0',out.getvalue())
 
 if __name__=='__main__': unittest.main()

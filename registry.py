@@ -491,6 +491,17 @@ def session_api(db, command, path, q, b, actor, token):
             except ValueError: row = db.execute('SELECT session_id FROM session_meta WHERE lower(slug)=%s ORDER BY started_at DESC LIMIT 1',(low,)).fetchone()
         if not row: fail('session not found',404)
         return session_public(session_row(db,row['session_id']))
+    if path=='/v1/sessions/flags' and command=='GET':
+        rows = db.execute('SELECT session_id,flag_reason FROM session_meta WHERE flagged AND flag_sent_at IS NULL ORDER BY started_at LIMIT 200').fetchall()
+        return {'items':[{'id':'a#'+r['session_id'],'reason':r['flag_reason']} for r in rows]}
+    if path=='/v1/sessions/flags/sent' and command=='POST':
+        ids = b.get('ids')
+        if not isinstance(ids,list) or not ids or len(ids)>200: fail('ids must be a non-empty array of at most 200 ids')
+        try: ids = [normalise(str(v)) for v in ids]
+        except ValueError: fail('invalid session id')
+        rows = db.execute('UPDATE session_meta SET flag_sent_at=now() WHERE session_id=ANY(%s) AND flagged AND flag_sent_at IS NULL RETURNING session_id',(ids,)).fetchall()
+        audit(db,actor,'session_flags_sent')
+        return {'marked':len(rows)}
     match = SESSION_ID.fullmatch(path)
     if not match: fail('endpoint not found',404)
     aid,what = match.groups()
@@ -566,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
             if not token: fail('invalid bearer token',401)
             self.token=token
             self.actor=token['name']
-            scope=('trace' if path.startswith('/v1/sessions') and self.command!='GET' else 'devices' if path=='/v1/devices' or path.startswith('/v1/devices/') else 'dict' if path.startswith('/v1/dictionary/') else 'admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
+            scope=('sync' if path=='/v1/sessions/flags/sent' else 'trace' if path.startswith('/v1/sessions') and self.command!='GET' else 'devices' if path=='/v1/devices' or path.startswith('/v1/devices/') else 'dict' if path.startswith('/v1/dictionary/') else 'admin' if path=='/v1/admin/sync-reset' else 'sync' if path=='/v1/sync' else 'dict' if path=='/v1/dictionary' else 'read' if self.command=='GET' else 'write')
             if scope not in token['scopes']: fail('insufficient scope: '+scope,403)
             body={}
             if self.command!='GET':
@@ -725,6 +736,21 @@ class Server(ThreadingHTTPServer):
             self.token_cache[digest]=(time.monotonic()+60,token)
         return token
 
+def trace_retention_loop(dsn, days, interval=86400, first=300):
+    """Daily 30-day trace retention inside the service, so no external writer needs database access."""
+    time.sleep(first)
+    while True:
+        try:
+            with psycopg.connect(dsn) as db:
+                removed=db.execute('SELECT session_trace_retention(%s)',(days,)).fetchone()[0]
+            print(json.dumps({'job':'session_trace_retention','days':days,'removed':removed}),flush=True)
+        except Exception as e:
+            print(json.dumps({'job':'session_trace_retention','error':type(e).__name__}),flush=True)
+        time.sleep(interval)
+
 def main():
-    Server((os.getenv('ARTIFACTS_BIND','0.0.0.0'),int(os.getenv('PORT','8080'))),os.environ['ARTIFACTS_DATABASE_URL']).serve_forever()
+    dsn=os.environ['ARTIFACTS_DATABASE_URL']
+    days=int(os.getenv('ARTIFACTS_TRACE_RETENTION_DAYS','30'))
+    if days>0: threading.Thread(target=trace_retention_loop,args=(dsn,days),daemon=True).start()
+    Server((os.getenv('ARTIFACTS_BIND','0.0.0.0'),int(os.getenv('PORT','8080'))),dsn).serve_forever()
 if __name__=='__main__': main()
