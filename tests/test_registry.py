@@ -647,6 +647,9 @@ class RegistryTests(unittest.TestCase):
             ev(36,8,'turn.user.start',8), ev(36,9,'transcript.user.final',8,text='[Markierung] Ich habe auf dem Bildschirm etwas markiert.',typed=True), ev(38,10,'turn.user.start',9),
             ev(38,11,'transcript.user.final',9,text='Was passiert beim Zeichnen?'), ev(38.5,12,'transcript.assistant.final',9,text='Du hast einen Kreis gezeichnet.'), ev(50,13,'session.stop',None,reason='client-stop')]
         d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, events)
+        self.assertEqual([x['turn'] for x in d['unanswered']], [8]); self.assertEqual([x['turn'] for x in d['turns']], [7,8,9]); self.assertEqual(d['markings'], 1)   # the old marking got no answer: a finding
+        answered = events[:9]+[ev(36.5,95,'transcript.assistant.final',8,text='Du hast die Tabelle markiert.')]+events[9:]
+        d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, answered)
         self.assertEqual(d['unanswered'], []); self.assertFalse(d['flagged']); self.assertEqual([x['turn'] for x in d['turns']], [7,9]); self.assertEqual(d['markings'], 1)
         # A question that really stayed without answer is still flagged, grown or not.
         d = S.diagnose({'id':'a#7f54a5','kind':'voice'}, events[:6]+[ev(30,7,'session.stop',None)])

@@ -120,8 +120,9 @@ def diagnose(meta, events):
     # Since gateway v0.1.5 a grown fragment keeps its turn id, so the last transcript is the question; older traces gave every fragment a new turn.
     same = lambda a, b: ' '.join(b.split()).startswith(' '.join(a.rstrip(' .,?!').split()))
     out['markings'] = sum(1 for x in turns if x.get('marker'))
-    turns = [x for i, x in enumerate(turns) if not x.get('marker') and not (
-        x['answer_at'] is None and x['question'] and i+1 < len(turns) and turns[i+1]['question'] and same(x['question'], turns[i+1]['question']))]
+    # A marking the agent did answer is no question; one it did not answer stays a finding, that was the bug in a#7f54a5.
+    turns = [x for i, x in enumerate(turns) if not (x.get('marker') and x['answer_at'] is not None) and not (
+        x['answer_at'] is None and not x.get('marker') and x['question'] and i+1 < len(turns) and turns[i+1]['question'] and same(x['question'], turns[i+1]['question']))]
     for i, x in enumerate(turns):
         last = i == len(turns)-1
         window_end = x['answer_at'] or (end if last else turns[i+1]['at'])
