@@ -22,7 +22,7 @@ endpoint is exposed. Use HTTPS at the reverse proxy.
 API routes:
 
 - GET `/v1/resolve?ids=a%23abcdef,card:123`, `/v1/exists?ids=abcdef`
-- GET `/v1/search?q=reserve&surface=example&kind=panel&limit=50`
+- GET `/v1/search?q=reserve&surface=example&kind=panel&limit=50`: tolerant and ranked. The query is split into significant words (fillers dropped, `1.3` kept); a row matches when ANY word matches (exact, then fuzzy `word_similarity`), ordered by words matched, title before summary, exact before fuzzy, recency last. A card number, alias or a#id anywhere in the query (`19209`, `karte 19209`, `card:19209`, `a#dbc8f1`) returns that row first. Items carry the additive fields `score` and `match` (`alias|exact|fuzzy`).
 - GET `/v1/list?surface=example`, `/v1/dictionary`
 - POST `/v1/ids` with `{ "count": 1, "surface": "example" }`
 - POST `/v1/artifacts`, PUT `/v1/artifacts/abcdef`
@@ -395,7 +395,9 @@ only). Device credentials are not registry tokens and get 401 everywhere.
 
 - `POST /v1/sessions` `{kind:voice|chat,provider,model,slug,page_aid,card,element,entry,device,client,gateway_commit,screen_ids}` -> `{id}` (6 hex). Allocates an artifact (kind session, surface desk:sessions), ref `endpoint /v1/sessions/<id>/trace`, related links to resolvable page/card/element/screen ids (unknown ones are skipped).
 - `POST /v1/sessions/<id>/events` `{events:[{seq,ts,source,turn,type,data}]}` -> `{accepted,duplicates,dropped,truncated}`. Max 500 events per batch (413), body max 4 MB. ts = epoch s/ms or ISO. Idempotent on (session,source,seq). Secrets in any string become `[REDACTED]`; fields named image/audio/pcm/png/jpeg and base64 runs over 1 KB are dropped and the event gets `data.dropped=true`; event data over 16 KB is replaced by `{truncated:true,bytes:n}`. Unknown id: 404. `session.stop` sets `ended_at`; stop, `turn.unanswered` and `watchdog.no_answer` re-run the diagnosis, which flags the session and updates the artifact summary.
-- `GET /v1/sessions/<id>/trace[?source=&limit=]` -> `{session,count,events}`; `GET /v1/sessions/<id>/diagnosis` -> `{session,diagnosis}`; `GET /v1/sessions/lookup?q=<a#id|hex|slug|last>` -> session meta.
+- `GET /v1/sessions/<id>/trace[?source=&limit=]` -> `{session,count,events}`; `GET /v1/sessions/<id>/diagnosis` -> `{session,diagnosis}`; `GET /v1/sessions/lookup?q=<a#id|hex|slug|last|previous|device>[&exclude=<a#id>]` -> session meta (`last`/`previous`/slugs only see voice and chat sessions and skip `exclude`; `device` is today's device trace, Berlin day). `GET /v1/sessions/recent[?limit=10&before=<ISO>&around=<ISO>&kind=voice|chat|device|all]` -> `{items:[{id,title,kind,provider,started_at,ended_at,flagged,summary}]}` newest first (default voice+chat; `around` = running at that time or started within 30 min of it).
+
+Migration `005_device_sessions.sql` (after 004, idempotent) allows session kind `device`: one trace per Berlin day, `POST /v1/sessions {kind:'device'}` returns today's id if it exists. Diagnosis marks a turn whose only assistant text is an announcement ("Ich zeichne dir das auf.") as unanswered with `announcement_only:true`.
 
 - `GET /v1/sessions/flags` (read) -> `{items:[{id,reason}]}` flagged sessions whose digest line is not sent yet; `POST /v1/sessions/flags/sent` `{ids:[...]}` (scope `sync`) -> `{marked}`.
 

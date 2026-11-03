@@ -88,7 +88,9 @@ Every Desk voice/chat session is an artifact (`kind=session`, surface `desk:sess
 started from, and a `howto`. Read it with:
 
 ```bash
-desk-trace last                  # newest session; or a#id, 6-hex id, or slug
+desk-trace last                  # newest voice/chat session; or a#id, 6-hex id, or slug
+desk-trace previous --exclude a#xxxxxx   # the one before (skips the running session)
+desk-trace device                # today's device trace (events outside a session, "Geräteprotokoll 3 Nov")
 desk-trace a#xxxxxx --diagnosis-only   # "Was ist passiert" + flags, no timeline
 desk-trace a#xxxxxx --json       # meta + diagnosis + events; --raw = one event per line
 ```
