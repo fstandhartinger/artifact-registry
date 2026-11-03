@@ -260,6 +260,59 @@ def lookup(db, value, reserved=False):
         aid = row['artifact_id'] if row else None
     return db.execute("SELECT * FROM artifact WHERE id=%s AND (status!='reserved' OR %s)",(aid,reserved)).fetchone() if aid else None
 
+FILLERS = frozenset('the a an and or of to in on for with is it der die das den dem des ein eine einen und oder von vom um zu zum zur mit im am ist es äh ähm aeh ehm uh um karte karten card cards bitte mal nur noch auch wo was wie geht'.split())
+SEARCH_TOKEN = re.compile(r'a#[0-9a-f]{6}|\d+(?:\.\d+)+|\w+')
+CARD_WORDS = re.compile(r'\b(?:karte|card)\s+#?(\d+)\b')
+
+def search_tokens(term):
+    """Significant words of a spoken query: fillers dropped, version numbers like 1.3 kept, at most 8."""
+    words = [w for w in SEARCH_TOKEN.findall(term.lower()) if not w.startswith('a#')]
+    kept = [w for w in dict.fromkeys(words) if w not in FILLERS and (len(w) > 1 or w.isdigit())]
+    return (kept or list(dict.fromkeys(words)))[:8]
+
+def search_aliases(term):
+    low = term.strip().lower()
+    out = [low]+['card:'+n for n in CARD_WORDS.findall(low)]+SEARCH_TOKEN.findall(low)
+    out += [w for w in re.findall(r'\w+', low) if w.isdigit() and len(w) > 2]
+    return list(dict.fromkeys(v for v in out if v))[:12]
+
+def search(db, term, narrow, limit, deadline):
+    """Tolerant ranked search: a row matches on ANY significant word; more words first, title before summary, exact before fuzzy, recency last.
+    A card number, alias or a#id anywhere in the query returns that row first. Uses the existing GIN indexes (search, title trigram); the summary is only scored on candidates."""
+    found = []; seen = set()
+    for candidate in search_aliases(term):
+        try: row = lookup(db, candidate)
+        except APIError: continue
+        if row and row['id'] not in seen and row['status'] == 'active' and all(row[k] == v for k, v in narrow.items()):
+            found.append(dict(row, _score=100.0, _match='alias')); seen.add(row['id'])
+    found = found[:limit]
+    tokens = search_tokens(term)
+    if tokens and len(found) < limit:
+        params = {f't{i}': t for i, t in enumerate(tokens)} | {f'n_{k}': v for k, v in narrow.items()}
+        where = ["status='active'"]+[f'{k}=%(n_{k})s' for k in narrow]
+        idx = range(len(tokens))
+        q = lambda i: f"plainto_tsquery('simple',%(t{i})s::text)"
+        fuzzy = lambda i: len(tokens[i]) >= 3  # shorter words are only matched exactly
+        cand = ' OR '.join(f"search @@ {q(i)}"+(f" OR %(t{i})s::text <%% title" if fuzzy(i) else '') for i in idx)
+        # at most the 500 newest candidates are scored, so a query of only common words stays bounded
+        # every per-word fact is computed once per candidate row, then summed
+        facts = ','.join(f"to_tsvector('simple',title) @@ {q(i)} AS te{i},search @@ {q(i)} AS se{i},"+(f"word_similarity(%(t{i})s::text,title) AS wt{i},word_similarity(%(t{i})s::text,summary) AS ws{i}" if fuzzy(i) else f"0::real AS wt{i},0::real AS ws{i}") for i in idx)
+        matched = '+'.join(f"(te{i} OR se{i} OR wt{i}>=0.5 OR ws{i}>=0.5)::int" for i in idx)
+        exact = '+'.join(f"(te{i} OR se{i})::int" for i in idx)
+        titled = '+'.join(f"(te{i} OR wt{i}>=0.5)::int" for i in idx)
+        score = '+'.join(f"CASE WHEN te{i} THEN 4 WHEN wt{i}>=0.5 THEN 2+wt{i} WHEN se{i} THEN 2 WHEN ws{i}>=0.5 THEN 1+ws{i} ELSE 0 END" for i in idx)
+        db.execute("SELECT set_config('pg_trgm.word_similarity_threshold','0.5',true)")
+        sql = f"WITH c AS (SELECT a.*,{facts} FROM (SELECT * FROM artifact WHERE {' AND '.join(where)} AND ({cand}) AND NOT (id=ANY(%(seen)s)) ORDER BY updated_at DESC LIMIT 500) a) SELECT c.*,({matched}) AS _matched,({exact}) AS _exact,({titled}) AS _titled,({score}) AS _score FROM c ORDER BY _matched DESC,_titled DESC,_score DESC,updated_at DESC,id LIMIT %(limit)s"
+        for r in db.execute(sql, params | {'seen': list(seen), 'limit': limit-len(found)}).fetchall():
+            found.append(dict(r, _match='exact' if r['_exact'] == r['_matched'] else 'fuzzy'))
+    items = []
+    for r in found:
+        score, match = r.pop('_score'), r.pop('_match')
+        for k in [k for k in r if k.startswith('_') or re.fullmatch(r'(?:te|se|wt|ws)\d',k)]: r.pop(k)
+        item = resolve(db, r, deadline); item['score'] = round(float(score), 2); item['match'] = match
+        items.append(item)
+    return items
+
 def validate_links(db, links, token=None):
     if links is None: return []
     if not isinstance(links,list) or len(links)>100: fail('links must be an array of at most 100 entries')
@@ -410,6 +463,11 @@ def session_refresh(db, aid):
     db.execute('UPDATE artifact SET summary=%s,updated_at=now() WHERE id=%s',(S.summary_for(diag)[:1200],aid))
     return diag
 
+def device_day_start(moment):
+    """Start of the Berlin calendar day, as UTC."""
+    local = local_time(moment)
+    return local.replace(hour=0,minute=0,second=0,microsecond=0).astimezone(timezone.utc)
+
 def local_time(moment):
     try: return moment.astimezone(ZoneInfo('Europe/Berlin'))
     except ZoneInfoNotFoundError: return moment
@@ -417,7 +475,7 @@ def local_time(moment):
 def session_create(db, b, actor, token):
     require_surface(token,'desk:sessions')
     kind = b.get('kind')
-    if kind not in ('voice','chat'): fail('kind must be voice or chat')
+    if kind not in ('voice','chat','device'): fail('kind must be voice, chat or device')
     provider = text_field(b.get('provider'),'provider',40,False)
     if not re.fullmatch(r'[\w.-]+',provider): fail('invalid provider')
     meta = {}
@@ -432,6 +490,9 @@ def session_create(db, b, actor, token):
     screens = b.get('screen_ids',[])
     if not isinstance(screens,list) or len(screens)>20: fail('screen_ids must be an array of at most 20 ids')
     now = datetime.now(timezone.utc)
+    if kind=='device':  # one trace per day: the gateway may ask again after every restart
+        today = db.execute("SELECT session_id FROM session_meta WHERE kind='device' AND started_at>=%s ORDER BY started_at DESC LIMIT 1",(device_day_start(now),)).fetchone()
+        if today: return {'id':today['session_id']}
     aid = allocate(db,'desk:sessions',actor)
     db.execute("UPDATE artifact SET kind='session',title=%s,status='active',access='private',updated_at=now() WHERE id=%s",(S.title_for(kind,provider,local_time(now)),aid))
     db.execute('INSERT INTO session_meta(session_id,kind,provider,model,slug,device,client,entry,gateway_commit,started_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
@@ -485,12 +546,34 @@ def session_api(db, command, path, q, b, actor, token):
     if path=='/v1/sessions/lookup' and command=='GET':
         value = text_field(q.get('q',[''])[0],'q',300,False).strip()
         low = value.lower()
-        if low=='last': row = db.execute('SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1').fetchone()
+        chat = "kind IN ('voice','chat')"  # last, previous and slugs never land on a device trace
+        if low in ('last','previous'):
+            skip = q.get('exclude',[''])[0]
+            try: skip = normalise(skip) if skip else None
+            except ValueError: fail('invalid exclude id')
+            row = db.execute(f'SELECT session_id FROM session_meta WHERE {chat} AND session_id IS DISTINCT FROM %s ORDER BY started_at DESC LIMIT 1',(skip,)).fetchone()
+        elif low=='device': row = db.execute("SELECT session_id FROM session_meta WHERE kind='device' AND started_at>=%s ORDER BY started_at DESC LIMIT 1",(device_day_start(datetime.now(timezone.utc)),)).fetchone()
         else:
             try: row = {'session_id':normalise(value)}
-            except ValueError: row = db.execute('SELECT session_id FROM session_meta WHERE lower(slug)=%s ORDER BY started_at DESC LIMIT 1',(low,)).fetchone()
+            except ValueError: row = db.execute(f'SELECT session_id FROM session_meta WHERE {chat} AND lower(slug)=%s ORDER BY started_at DESC LIMIT 1',(low,)).fetchone()
         if not row: fail('session not found',404)
         return session_public(session_row(db,row['session_id']))
+    if path=='/v1/sessions/recent' and command=='GET':
+        get = lambda key: q.get(key,[''])[0]
+        try: limit = int(get('limit') or 10)
+        except ValueError: fail('limit must be an integer')
+        if not 1<=limit<=50: fail('limit must be between 1 and 50')
+        kind = get('kind') or 'chat+voice'
+        if kind not in ('voice','chat','device','chat+voice','all'): fail('kind must be voice, chat, device or all')
+        where = ['TRUE']; vals = []
+        if kind!='all': where.append('m.kind=ANY(%s)'); vals.append(['voice','chat'] if kind=='chat+voice' else [kind])
+        for name,clause in (('before','m.started_at<%s'),('around',"(m.started_at BETWEEN %s-interval '30 minutes' AND %s+interval '30 minutes' OR (m.started_at<=%s AND coalesce(m.ended_at,m.started_at+interval '6 hours')>=%s))")):
+            if get(name):
+                try: moment = S.parse_ts(get(name))
+                except ValueError: fail(name+' must be an ISO time')
+                where.append(clause); vals += [moment]*clause.count('%s')
+        rows = db.execute('SELECT m.session_id,a.title,m.kind,m.provider,m.started_at,m.ended_at,m.flagged,a.summary FROM session_meta m JOIN artifact a ON a.id=m.session_id WHERE '+' AND '.join(where)+' ORDER BY m.started_at DESC LIMIT %s',vals+[limit]).fetchall()
+        return {'items':[{'id':'a#'+r['session_id'],'title':r['title'],'kind':r['kind'],'provider':r['provider'],'started_at':r['started_at'],'ended_at':r['ended_at'],'flagged':r['flagged'],'summary':r['summary']} for r in rows]}
     if path=='/v1/sessions/flags' and command=='GET':
         rows = db.execute('SELECT session_id,flag_reason FROM session_meta WHERE flagged AND flag_sent_at IS NULL ORDER BY started_at LIMIT 200').fetchall()
         return {'items':[{'id':'a#'+r['session_id'],'reason':r['flag_reason']} for r in rows]}
@@ -650,15 +733,11 @@ class Handler(BaseHTTPRequestHandler):
                 try: limit=int(get('limit','50'))
                 except ValueError: fail('limit must be an integer')
                 if not 1<=limit<=200: fail('limit must be between 1 and 200')
-                filters=["status='active'"]; vals=[]
-                for key in ('surface','kind'):
-                    if get(key): filters.append(key+'=%s'); vals.append(get(key))
+                narrow={key:get(key) for key in ('surface','kind') if get(key)}
                 if path.endswith('search'):
-                    term=text_field(get('q'),'q',500)
-                    filters.append('(search @@ plainto_tsquery(\'simple\',%s) OR title %% %s OR title ILIKE %s)')
-                    vals += [term,term,'%'+term.replace('\\','\\\\').replace('%',r'\%').replace('_',r'\_')+'%']
-                vals.append(limit)
-                rows=db.execute('SELECT * FROM artifact WHERE '+' AND '.join(filters)+' ORDER BY updated_at DESC,id LIMIT %s',vals).fetchall()
+                    return {'items':search(db,text_field(get('q'),'q',500),narrow,limit,self.sha_deadline)}
+                filters=["status='active'"]+[key+'=%s' for key in narrow]
+                rows=db.execute('SELECT * FROM artifact WHERE '+' AND '.join(filters)+' ORDER BY updated_at DESC,id LIMIT %s',list(narrow.values())+[limit]).fetchall()
                 return {'items':[resolve(db,r,self.sha_deadline) for r in rows]}
             if path=='/v1/verify-refs':
                 after=get('after')

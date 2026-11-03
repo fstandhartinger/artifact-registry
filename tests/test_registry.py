@@ -55,6 +55,8 @@ class RegistryTests(unittest.TestCase):
             db.execute(migration3); db.execute(migration3)
             migration4=(Path(__file__).resolve().parents[1]/'migrations/004_sessions.sql').read_text()
             db.execute(migration4); db.execute(migration4)
+            migration5=(Path(__file__).resolve().parents[1]/'migrations/005_device_sessions.sql').read_text()
+            db.execute(migration5); db.execute(migration5)
         cls.server=Server(('127.0.0.1',0),cls.dsn)
         cls.thread=threading.Thread(target=cls.server.serve_forever,daemon=True); cls.thread.start()
         cls.base='http://127.0.0.1:'+str(cls.server.server_port)
@@ -759,5 +761,75 @@ class RegistryTests(unittest.TestCase):
         with patch.object(registry.time,'sleep',sleep), contextlib.redirect_stdout(io.StringIO()) as out:
             with self.assertRaises(Stop): registry.trace_retention_loop(self.dsn,30,interval=7,first=0)
         self.assertEqual(calls,[0,7]); self.assertIn('"removed": 0',out.getvalue())
+
+    def put(self,**data):
+        data=dict({'kind':'card','surface':'search-test'},**data)
+        status,row=self.request('/v1/artifacts',data); self.assertEqual(status,200,row); return row['id']
+    def search(self,q,**extra):
+        status,res=self.request('/v1/search?q='+urllib.parse.quote(q)+''.join(f'&{k}={v}' for k,v in extra.items()),token='reader'); self.assertEqual(status,200,res); return res['items']
+    def test_search_is_tolerant_ranked_and_knows_numbers(self):
+        reax=self.put(title='REAX 1.3 today: lock the engine with the long-input rule',summary='Karte zum Engine-Lock',aliases=['card:19209'])
+        other=self.put(title='REAX 1.2 changelog',summary='old engine notes')
+        self.put(title='Unrelated billing page',summary='invoices')
+        items=self.search('Log the Engine Reax 1.3')  # the literal misheard phrase of a#624670: "log" for "lock", filler "the"
+        self.assertEqual(items[0]['id'],reax); self.assertIn(other,[i['id'] for i in items]); self.assertNotIn('Unrelated billing page',[i['title'] for i in items])
+        self.assertEqual(items[0]['match'],'fuzzy'); self.assertEqual(self.search('Reax 1.3 engine')[0]['match'],'exact'); self.assertGreater(items[0]['score'],items[1]['score'])
+        self.assertEqual(self.search('lok the enjin')[0]['id'],reax)  # one misheard word per token still finds it by trigram
+        for q in ('19209','karte 19209','Karte 19209 bitte','card:19209','Mach die Karte 19209 auf'):
+            first=self.search(q)[0]; self.assertEqual((first['id'],first['match']),(reax,'alias'),q)
+        self.assertEqual(self.search('a#'+other+' engine')[0]['id'],other)
+        self.assertEqual(self.search('19209',surface='nowhere'),[])
+        self.assertEqual(len(self.search('engine',limit=1)),1)
+        self.assertEqual(self.search('zzzz qqqq'),[])
+        self.assertEqual(self.search(''),[])
+    def test_search_uses_the_indexes_on_a_large_table(self):
+        with psycopg.connect(self.dsn) as db:
+            db.execute("INSERT INTO artifact(id,kind,title,summary,surface,status) SELECT lpad(to_hex(n),6,'0'),'card','Filler title '||md5(n::text),'summary '||md5((n+1)::text),'bulk','active' FROM generate_series(1048576,1068576) n")
+            db.execute('ANALYZE artifact'); db.execute("SELECT set_config('enable_seqscan','off',true)")
+            plan='\n'.join(r[0] for r in db.execute("EXPLAIN SELECT id FROM artifact WHERE status='active' AND (search @@ plainto_tsquery('simple','engine') OR 'engine'::text <% title)"))
+        self.assertIn('Bitmap',plan); self.assertNotIn('Seq Scan',plan)
+        with psycopg.connect(self.dsn) as db: db.execute("DELETE FROM artifact WHERE surface='bulk'")
+    def test_session_lookup_skips_device_and_running_sessions_and_lists_recent(self):
+        first=self.new_session(slug='one'); second=self.new_session(slug='two')
+        status,dev=self.request('/v1/sessions',{'kind':'device','provider':'device'},token='desk'); self.assertEqual(status,200,dev)
+        status,again=self.request('/v1/sessions',{'kind':'device','provider':'device'},token='desk'); self.assertEqual(again['id'],dev['id'])  # one per day
+        look=lambda q,**extra: self.request('/v1/sessions/lookup?'+urllib.parse.urlencode(dict(q=q,**extra)),token='reader')
+        self.assertEqual(look('last')[1]['id'],'a#'+second); self.assertEqual(look('previous')[1]['id'],'a#'+second)
+        self.assertEqual(look('last',exclude='a#'+second)[1]['id'],'a#'+first)
+        self.assertEqual(look('previous',exclude=second)[1]['id'],'a#'+first)
+        self.assertEqual(self.request('/v1/sessions/lookup?q=last&exclude=zz',token='reader')[0],422)
+        self.assertEqual(look('device')[1]['id'],'a#'+dev['id']); self.assertEqual(look('a#'+dev['id'])[1]['kind'],'device')
+        with psycopg.connect(self.dsn) as db: db.execute("UPDATE session_meta SET slug='geraete' WHERE session_id=%s",(dev['id'],))
+        self.assertEqual(look('geraete')[0],404)
+        self.assertRegex(look('device')[1]['title'],r'^Geräteprotokoll \d{1,2} \w+$')
+        status,res=self.request('/v1/sessions/recent',token='reader'); ids=[i['id'] for i in res['items']]
+        self.assertEqual(ids,['a#'+second,'a#'+first]); self.assertEqual(set(res['items'][0]),{'id','title','kind','provider','started_at','ended_at','flagged','summary'})
+        self.assertEqual([i['id'] for i in self.request('/v1/sessions/recent?kind=device',token='reader')[1]['items']],['a#'+dev['id']])
+        self.assertEqual(len(self.request('/v1/sessions/recent?kind=all',token='reader')[1]['items']),3)
+        self.assertEqual(len(self.request('/v1/sessions/recent?limit=1',token='reader')[1]['items']),1)
+        self.assertEqual(self.request('/v1/sessions/recent?before=2020-01-01T00:00:00Z',token='reader')[1]['items'],[])
+        self.assertEqual(len(self.request('/v1/sessions/recent?around='+urllib.parse.quote(datetime.utcnow().isoformat()+'Z'),token='reader')[1]['items']),2)
+        self.assertEqual(self.request('/v1/sessions/recent?before=nonsense',token='reader')[0],422)
+        self.assertEqual(self.request('/v1/sessions/recent?kind=x',token='reader')[0],422)
+        # device traces get a sane diagnosis and are never flagged
+        self.request(f"/v1/sessions/{dev['id']}/events",self.events([(0,'device.hotkey',None,{}),(5,'watchdog.no_answer',None,{})]),token='desk')
+        d=self.request(f"/v1/sessions/{dev['id']}/diagnosis",token='reader')[1]['diagnosis']
+        self.assertEqual((d['kind'],d['flagged'],d['unanswered']),('device',False,[])); self.assertIn('Geräteprotokoll',d['what_happened'])
+    def test_announcement_only_turn_is_unanswered(self):
+        import datetime as dt, sessions as S
+        t0=dt.datetime(2026,11,3,9,29,tzinfo=dt.timezone.utc)
+        def ev(sec,seq,type_,turn,**data): return {'ts':t0+dt.timedelta(seconds=sec),'seq':seq,'source':'gateway','turn':turn,'type':type_,'data':data}
+        # shape of a#624670 turn 1: announcements, an unrelated tool call, "Ich zeichne dir das auf.", 11 s of silence, the next user turn is answered
+        events=[ev(0,1,'turn.user.start',1),ev(0,2,'transcript.user.final',1,text='Kannst du diese Karte aufzeichnen?'),ev(1,3,'transcript.assistant.final',1,text='Ich schaue nach.'),
+            ev(2,4,'tool.call',1,name='artifact_resolve',call_id='c1'),ev(3,5,'tool.done',1,call_id='c1'),ev(8,6,'transcript.assistant.final',1,text='Ich zeichne dir das auf.'),
+            ev(19,7,'turn.user.start',2),ev(19,8,'transcript.user.final',2,text='Schau dir den Bildschirm an.'),ev(22,9,'transcript.assistant.final',2,text='Auf dem Bildschirm sind drei Karten zu sehen.'),ev(30,10,'session.stop',None)]
+        d=S.diagnose({'id':'a#624670','kind':'voice'},events)
+        self.assertEqual([(r['turn'],r['answered'],r['announcement_only']) for r in d['turns']],[(1,False,True),(2,True,False)])
+        self.assertEqual([r['turn'] for r in d['unanswered']],[1]); self.assertTrue(d['flagged']); self.assertIn('nur Ankündigung',d['flag_reason']); self.assertNotIn('Karte',d['flag_reason'])
+        # content after an announcement answers the turn
+        ok=[ev(0,1,'turn.user.start',1),ev(0,2,'transcript.user.final',1,text='Was steht da?'),ev(1,3,'transcript.assistant.final',1,text='Ich lese den Volltext.'),ev(6,4,'transcript.assistant.final',1,text='Da steht: Lock the engine with the long-input rule.'),ev(9,5,'session.stop',None)]
+        d=S.diagnose({'id':'a#1','kind':'voice'},ok); self.assertEqual((d['unanswered'],d['flagged'],d['turns'][0]['announcement_only']),([],False,False))
+        for text in ('Ich zeichne dir das auf.','Ich schaue nach.','Ich lese den Volltext.','Moment.','Einen Moment, ich schaue nach.'): self.assertTrue(S.is_announcement(text),text)
+        for text in ('Ich sehe einen Kreis.','Ich lese: Lock the engine.','Die Karte heißt REAX 1.3.','Ich zeichne einen Kreis um die Zahl, weil sie die wichtigste im ganzen Bild ist und du sie sehen sollst.'): self.assertFalse(S.is_announcement(text),text)
 
 if __name__=='__main__': unittest.main()

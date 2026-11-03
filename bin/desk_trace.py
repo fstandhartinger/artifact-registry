@@ -69,12 +69,13 @@ def render_diagnosis(d):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='desk-trace', description='Read a Desk session trace')
-    parser.add_argument('session', help='a#id, 6-hex id, slug or "last"')
+    parser.add_argument('session', help='a#id, 6-hex id, slug, "last", "previous" or "device" (today\'s device trace)')
+    parser.add_argument('--exclude', help='a#id to skip for last/previous (the session that is running now)')
     parser.add_argument('--json', action='store_true'); parser.add_argument('--raw', action='store_true'); parser.add_argument('--diagnosis-only', action='store_true')
     args = parser.parse_args(argv)
     try:
         client = Client()
-        meta = client.request('/v1/sessions/lookup', q=args.session)
+        meta = client.request('/v1/sessions/lookup', **({'exclude': args.exclude} if args.exclude else {}), q=args.session)
         aid = meta['id'].removeprefix('a#')
         diagnosis = client.request(f'/v1/sessions/{aid}/diagnosis')['diagnosis']
         events = [] if args.diagnosis_only else client.request(f'/v1/sessions/{aid}/trace')['events']

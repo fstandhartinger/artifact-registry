@@ -49,11 +49,20 @@ def scrub(value, secret, depth=0):
     return value, False
 
 def title_for(kind, provider, when):
+    if kind == 'device': return f'Geräteprotokoll {when.day} {MONTHS[when.month-1]}'
     return f"{'Voice' if kind == 'voice' else 'Chat'}-Sitzung {when.day} {MONTHS[when.month-1]} {when:%H:%M} ({provider})"
 
 def _text(event):
     value = event['data'].get('text') or event['data'].get('transcript')
     return value.strip() if isinstance(value, str) else ''
+
+# "Ich zeichne dir das auf." is a promise, not an answer (a#624670: 11 s of silence after it). Short sentences only, so content after the verb is never swallowed.
+_ANNOUNCE = re.compile(r"(?:(?:ok(?:ay)?|ja|gut|klar|alles klar|sofort|gleich|gerne|natürlich|(?:einen |ein )?(?:kleinen )?(?:moment|augenblick|sekunde)(?: (?:bitte|noch|kurz))?)[ ,]+)*(?:(?:einen |ein )?(?:kleinen )?(?:moment|augenblick|sekunde)(?: (?:bitte|noch|kurz))?|gleich|kurz|warte kurz|ich (?:(?:schaue|schau|gucke|prüfe|überprüfe|checke|suche|lese|öffne|hole|zeichne|male|skizziere|notiere|markiere|erstelle|recherchiere|rufe|sehe nach)\b.*|(?:werde|will|muss) .*(?:nachschauen|nachsehen|aufzeichnen|zeichnen|lesen|suchen|prüfen|nachlesen)))")
+
+def is_announcement(text):
+    """True when every sentence of an assistant text only announces work."""
+    sentences = [x.strip(' ,;-–…"„“') for x in re.split(r'[.!?…]+', text.lower()) if x.strip(' ,;-–…"„“')]
+    return bool(sentences) and len(text) <= 160 and all(len(x.split()) <= 10 and ':' not in x and _ANNOUNCE.fullmatch(x) for x in sentences)
 
 def _num(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
@@ -66,7 +75,7 @@ def diagnose(meta, events):
     ev = sorted(events, key=lambda e: (e['ts'], e['seq']))
     out = {'session': meta.get('id'), 'events': len(ev), 'turns': [], 'unanswered': [], 'silent_gaps': [], 'stale': [], 'tool_errors': [],
            'provider_errors': [], 'watchdog': [], 'barge_ins': 0, 'mute_s': 0.0, 'frames': {}, 'cost_usd': None, 'duration_s': 0.0,
-           'ended': bool(meta.get('ended_at')), 'flagged': False, 'flag_reason': None, 'what_happened': 'Keine Ereignisse aufgezeichnet.'}
+           'kind': meta.get('kind') or 'voice', 'ended': bool(meta.get('ended_at')), 'flagged': False, 'flag_reason': None, 'what_happened': 'Keine Ereignisse aufgezeichnet.'}
     if not ev: return out
     t0 = ev[0]['ts']; rel = lambda ts: round((ts-t0).total_seconds(), 1)
     stop = next((e for e in reversed(ev) if e['type'] == 'session.stop'), None)
@@ -88,7 +97,9 @@ def diagnose(meta, events):
             if d.get('marker') or (cur['question'] or '').startswith('[Markierung]'): cur['marker'] = True
         elif t == 'transcript.assistant.final' and _text(e) and turns:
             cur = next((x for x in reversed(turns) if e['turn'] is not None and x['turn'] == e['turn']), turns[-1])
-            if cur['answer_at'] is None: cur['answer_at'] = e['ts']
+            if cur['answer_at'] is None:
+                if is_announcement(_text(e)): cur.setdefault('announce_at', e['ts'])
+                else: cur['answer_at'] = e['ts']
         elif t == 'tool.call': calls[str(d.get('call_id') or d.get('id'))] = d.get('name') or d.get('tool')
         elif t == 'tool.stale':
             cid = str(d.get('call_id') or d.get('id'))
@@ -117,6 +128,7 @@ def diagnose(meta, events):
     out['mute_s'] = round(out['mute_s'], 1)
     out['cost_usd'] = stop_cost if stop_cost is not None else (round(cost_sum, 4) if cost_seen else None)
     ended = out['ended']
+    if out['kind'] == 'device': turns = []  # device events outside a session have no questions to answer
     # One sentence the vendor delivered in growing fragments is one question, and a drawn marking is context, not a question (a#7f54a5).
     # Since gateway v0.1.5 a grown fragment keeps its turn id, so the last transcript is the question; older traces gave every fragment a new turn.
     words = lambda t: re.sub(r'[^\w ]', ' ', t.lower()).split()
@@ -132,7 +144,7 @@ def diagnose(meta, events):
         last = i == len(turns)-1
         window_end = x['answer_at'] or (end if last else turns[i+1]['at'])
         answered = x['answer_at'] is not None
-        row = {'turn': x['turn'], 'at_s': rel(x['at']), 'question': x['question'], 'answered': answered, 'answer_at_s': rel(x['answer_at']) if answered else None}
+        row = {'turn': x['turn'], 'at_s': rel(x['at']), 'question': x['question'], 'answered': answered, 'announcement_only': not answered and 'announce_at' in x, 'answer_at_s': rel(x['answer_at']) if answered else None}
         out['turns'].append(row)
         if not answered and (ended or not last or x['turn'] in markers or any(a >= x['at'] for a in no_answer_at)):
             out['unanswered'].append(row)
@@ -142,12 +154,13 @@ def diagnose(meta, events):
                 out['silent_gaps'].append({'turn': x['turn'], 'from_s': rel(a), 'to_s': rel(b), 'seconds': round((b-a).total_seconds(), 1), 'question_waiting': True, 'answered': answered})
     reasons = []
     if out['unanswered']:
-        reasons.append(f"{len(out['unanswered'])} Frage(n) ohne Antwort")  # no question text: this line goes to the board digest and outlives the trace
+        reasons.append(f"{len(out['unanswered'])} Frage(n) ohne Antwort" + (f" ({sum(r['announcement_only'] for r in out['unanswered'])} nur Ankündigung)" if any(r['announcement_only'] for r in out['unanswered']) else ''))  # no question text: this line goes to the board digest and outlives the trace
     if out['unanswered'] and out['stale']: reasons.append('Ergebnis veraltet' + (f" ({out['stale'][0]['tool']})" if out['stale'][0]['tool'] else ''))
     if out['unanswered'] and out['silent_gaps']: reasons.append(f"Stille {int(max(g['seconds'] for g in out['silent_gaps']))} s")
     out['flagged'] = bool(out['unanswered']); out['flag_reason'] = '; '.join(reasons)[:300] if reasons else None
     lines = [f"Sitzung ({meta.get('kind') or 'voice'}, {meta.get('provider') or '?'}) dauerte {_dur(out['duration_s'])}" + (f", Kosten USD {out['cost_usd']:.2f}." if out['cost_usd'] is not None else '.')]
-    lines.append(f"{len(out['turns'])} Frage(n), {len(out['unanswered'])} ohne Antwort" + (f": „{(out['unanswered'][0]['question'] or 'ohne Transkript')[:80]}“ (bei {out['unanswered'][0]['at_s']} s)." if out['unanswered'] else '.'))
+    if out['kind'] == 'device': lines = [f"Geräteprotokoll ({meta.get('provider') or '?'}) mit {len(ev)} Ereignissen über {_dur(out['duration_s'])}."]
+    else: lines.append(f"{len(out['turns'])} Frage(n), {len(out['unanswered'])} ohne Antwort" + (f": „{(out['unanswered'][0]['question'] or 'ohne Transkript')[:80]}“ (bei {out['unanswered'][0]['at_s']} s)" + (', nur eine Ankündigung gesagt.' if out['unanswered'][0]['announcement_only'] else '.') if out['unanswered'] else '.'))
     if out['stale']:
         s = out['stale'][0]
         lines.append(f"Ergebnis von {s['tool'] or 'einem Werkzeug'} kam veraltet an (stale)" + (f" nach {s['age_s']:g} s" if s['age_s'] is not None else '') + (f"; insgesamt {len(out['stale'])}×." if len(out['stale']) > 1 else '.'))
@@ -166,6 +179,7 @@ def diagnose(meta, events):
     return out
 
 def summary_for(diag):
+    if diag.get('kind') == 'device': return f"{diag['events']} Ereignisse"
     parts = [f"{len(diag['turns'])} Turn(s)"]
     if diag['unanswered']: parts.append(f"{len(diag['unanswered'])} unbeantwortet")
     if diag['silent_gaps']: parts.append(f"Stille bis {int(max(g['seconds'] for g in diag['silent_gaps']))} s")
