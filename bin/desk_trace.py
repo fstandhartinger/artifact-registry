@@ -7,6 +7,8 @@ from datetime import datetime
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,7 +69,14 @@ def render_diagnosis(d):
     out.append(f"Mikro stumm: {d['mute_s']} s; Bilder: {json.dumps(d['frames'])}; Unterbrechungen: {d['barge_ins']}; Kosten USD: {d['cost_usd']}")
     return out
 
+def relay(argv):
+    # No token in this shell (LeChonk keeps none): the same read goes through Sandy's read-only relay, so no secret lands here.
+    tool = shutil.which('sandy-read') or str(Path.home()/'bin/sandy-read')
+    if not os.access(tool, os.X_OK) or os.environ.get('DESK_TRACE_NO_RELAY'): return None
+    return subprocess.run([tool, 'desk-trace', *argv]).returncode
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
     parser = argparse.ArgumentParser(prog='desk-trace', description='Read a Desk session trace')
     parser.add_argument('session', help='a#id, 6-hex id, slug, "last", "previous" or "device" (today\'s device trace)')
     parser.add_argument('--exclude', help='a#id to skip for last/previous (the session that is running now)')
@@ -75,6 +84,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         client = Client()
+        if not client.token:
+            code = relay(argv)
+            if code is not None: return code
+            print('desk-trace: no ARTIFACTS_AGENT_TOKEN and no sandy-read relay on this host', file=sys.stderr); return 1
         meta = client.request('/v1/sessions/lookup', **({'exclude': args.exclude} if args.exclude else {}), q=args.session)
         aid = meta['id'].removeprefix('a#')
         diagnosis = client.request(f'/v1/sessions/{aid}/diagnosis')['diagnosis']
