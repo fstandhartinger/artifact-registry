@@ -588,6 +588,13 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(self.request('/v1/dictionary/Learned',token='reader',method='DELETE')[0],403)
         self.assertEqual(self.request('/v1/dictionary/Manual',token='desk',method='DELETE')[0],404)
         self.assertEqual(self.request('/v1/dictionary/Learned',token='desk',method='DELETE')[0],200)
+        self.request('/v1/dictionary',{'term':'Edit','replace_from':['Old','Older'],'source':'wispr'},token='desk')
+        self.assertEqual(self.request('/v1/dictionary',{'term':'Edit','replace_from':['New'],'replace':True},token='desk')[0],200)
+        row=[r for r in self.request('/v1/dictionary')[1]['items'] if r['term']=='Edit'][0]
+        self.assertEqual((row['replace_from'],row['source']),(['New'],'manual'))
+        self.assertEqual(self.request('/v1/dictionary/Edit?any=1',token='reader',method='DELETE')[0],403)
+        self.assertEqual(self.request('/v1/dictionary/Edit?any=1',token='desk',method='DELETE')[0],200)
+        self.assertEqual(self.request('/v1/dictionary/Edit?any=1',token='desk',method='DELETE')[0],404)
 
     INCIDENT=[(0,'session.start',None,{'provider':'openai'}),(3.2,'turn.user.start',1,{}),(3.5,'transcript.user.final',1,{'text':'Was weißt du über TNG?'}),
               (4,'tool.call',1,{'name':'knowledge_read','call_id':'c1','args':{'q':'TNG'}}),(45,'tool.stale',1,{'call_id':'c1','age_s':41}),

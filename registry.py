@@ -709,8 +709,10 @@ class Handler(BaseHTTPRequestHandler):
             return {'ok':True}
         if path.startswith('/v1/dictionary/') and self.command=='DELETE':
             term=text_field(unquote(path.removeprefix('/v1/dictionary/')),'term',200,False)
-            row=db.execute("DELETE FROM dictionary WHERE term=%s AND source='learned' RETURNING term",(term,)).fetchone()
-            if not row: fail('learned term not found',404)
+            # ?any=1: the dictionary window in the Screen Agent edits every word; the plain call stays learned-only.
+            any_source=(q.get('any') or [''])[0]=='1'
+            row=db.execute("DELETE FROM dictionary WHERE term=%s"+("" if any_source else " AND source='learned'")+" RETURNING term",(term,)).fetchone()
+            if not row: fail('term not found' if any_source else 'learned term not found',404)
             audit(db,actor,'dictionary_delete')
             return {'ok':True}
         if path.startswith('/v1/sessions'): return session_api(db,self.command,path,q,b,actor,self.token)
@@ -789,6 +791,10 @@ class Handler(BaseHTTPRequestHandler):
             for replacement in replacements: text_field(replacement,'replace_from',200,False); guard(replacement)
             source=b.get('source','manual')
             if not isinstance(source,str) or source not in {'wispr','harvest','learned','manual'}: fail('invalid dictionary source')
+            if b.get('replace') is True:   # exactly these wrong forms, from the dictionary window: nothing is merged in
+                db.execute("INSERT INTO dictionary(term,replace_from,source) VALUES(%s,%s,'manual') ON CONFLICT(term) DO UPDATE SET replace_from=EXCLUDED.replace_from,source='manual'",(term,replacements))
+                audit(db,actor,'dictionary')
+                return {'term':term}
             db.execute("INSERT INTO dictionary(term,replace_from,source) VALUES(%s,%s,%s) ON CONFLICT(term) DO UPDATE SET replace_from=(SELECT ARRAY(SELECT DISTINCT unnest(dictionary.replace_from || EXCLUDED.replace_from))),source=CASE WHEN dictionary.source='learned' THEN EXCLUDED.source ELSE dictionary.source END",(term,replacements,source))
             audit(db,actor,'dictionary')
             return {'term':term}

@@ -378,6 +378,8 @@ are stored or returned; callers provide HMAC-SHA256 hashes.
 - `DELETE /v1/devices/:id`: empty body or `{}` -> `{ok:true}`; sets revoked_at idempotently.
 - `DELETE /v1/dictionary/:term`: scope dict, URL-encoded term, empty body or `{}` -> `{ok:true}`.
   Only source=learned rows can be deleted; manual/harvest/wispr/unknown return 404.
+  `?any=1` deletes a row of any source (the dictionary window in the Screen Agent); an unknown term returns 404.
+- `POST /v1/dictionary` with `replace:true`: scope dict; the row gets exactly these `replace_from` values and source=manual, nothing is merged.
   A learned upsert does not convert an existing non-learned row into a deletable learned row.
 
 The integration test applies migration 003 twice in its owned throwaway database and checks
