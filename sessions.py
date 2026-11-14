@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 MAX_EVENT_BYTES = 16 * 1024
 MAX_BATCH = 500
 SILENCE_S = 20
+FRAGMENT_GAP_S = 60  # user finals closer than this with no assistant answer between them are one question (a#41d6d2)
 BLOB_NAMES = {'image','images','audio','pcm','png','jpeg','jpg'}
 
 def blob_field(key, item):
@@ -140,15 +141,31 @@ def diagnose(meta, events):
     grown = {id(x) for x, nxt in zip(spoken, spoken[1:]) if x['answer_at'] is None and x['question'] and nxt['question'] and same(x['question'], nxt['question'])}
     grown |= {id(x) for x in spoken if x['answer_at'] is None and x['question'] and words(x['question']) in [words(t) for t in superseded]}
     turns = [x for x in turns if id(x) not in grown and not (x.get('marker') and last_answer is not None and last_answer >= x['at'])]
+    # Fragments of one thought are one question (a#41d6d2, 14 Nov 2026): he went on speaking while search_files ran for 21 s, the recogniser delivered two
+    # finals ("... Abstammungs..." / "Vorfall vorliegt.") with no assistant answer between them, and the answer came to the third, 8 s later, covering all three.
+    # A spoken turn with no answer and no announcement, followed within FRAGMENT_GAP_S by the next spoken turn, joins that next turn; the chain is answered
+    # when an answer follows its last final, and a chain that never gets one is ONE unanswered question, not one per fragment.
+    chained = []
+    for x in turns:
+        prev = chained[-1] if chained else None
+        if (prev is not None and not x.get('marker') and not prev.get('marker') and prev['answer_at'] is None and 'announce_at' not in prev
+                and prev['question'] and x['question'] and (x['at']-prev['last_at']).total_seconds() <= FRAGMENT_GAP_S):
+            prev['question'] = f"{prev['question']} {x['question']}"
+            prev['ids'] = prev['ids']+[x['turn']]; prev['last_at'] = x['at']; prev['answer_at'] = x['answer_at']
+            if 'announce_at' in x: prev['announce_at'] = x['announce_at']
+        else:
+            x['ids'] = [x['turn']]; x['last_at'] = x['at']; chained.append(x)
+    turns = chained
     for i, x in enumerate(turns):
         last = i == len(turns)-1
         window_end = x['answer_at'] or (end if last else turns[i+1]['at'])
         answered = x['answer_at'] is not None
         row = {'turn': x['turn'], 'at_s': rel(x['at']), 'question': x['question'], 'answered': answered, 'announcement_only': not answered and 'announce_at' in x, 'answer_at_s': rel(x['answer_at']) if answered else None}
+        if len(x['ids']) > 1: row['fragments'] = len(x['ids'])
         out['turns'].append(row)
-        if not answered and (ended or not last or x['turn'] in markers or any(a >= x['at'] for a in no_answer_at)):
+        if not answered and (ended or not last or any(t in markers for t in x['ids']) or any(a >= x['at'] for a in no_answer_at)):
             out['unanswered'].append(row)
-        points = [x['at']]+[e['ts'] for e in ev if e['type'] in PROGRESS and x['at'] < e['ts'] < window_end]+[window_end]
+        points = [x['last_at']]+[e['ts'] for e in ev if e['type'] in PROGRESS and x['last_at'] < e['ts'] < window_end]+[window_end]
         for a, b in zip(points, points[1:]):
             if (b-a).total_seconds() > SILENCE_S:
                 out['silent_gaps'].append({'turn': x['turn'], 'from_s': rel(a), 'to_s': rel(b), 'seconds': round((b-a).total_seconds(), 1), 'question_waiting': True, 'answered': answered})
