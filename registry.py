@@ -9,10 +9,13 @@ import sys
 import threading
 import time
 import uuid
+import logging
+import logkit
 import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+LOG=logging.getLogger('artifact-registry')
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit, unquote
@@ -602,6 +605,9 @@ def session_api(db, command, path, q, b, actor, token):
 class Handler(BaseHTTPRequestHandler):
     server_version='ArtifactRegistry/1'
     def log_message(self,*args): pass
+    def end_headers(self):
+        if getattr(self,'request_id',None): self.send_header('X-Request-Id',self.request_id)
+        super().end_headers()
     def reply(self,status,data):
         raw=json.dumps(data,default=lambda x:str(x) if isinstance(x,uuid.UUID) else x.isoformat(),ensure_ascii=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8')
@@ -612,7 +618,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self): self.handle_api()
     def do_DELETE(self): self.handle_api()
     def handle_api(self):
-        status=500; actor=None
+        status=500; actor=None; t0=time.perf_counter()
+        rid=logkit._clean_rid(self.headers.get('X-Request-Id')); logkit.request_id_var.set(rid); self.request_id=rid
         try:
             self.connection.settimeout(15)
             parsed=urlsplit(self.path); path=parsed.path
@@ -651,9 +658,13 @@ class Handler(BaseHTTPRequestHandler):
         except (psycopg.Error,OSError):
             status=503; self.close_connection=True; self.reply(status,{'error':'registry unavailable'})
         except Exception:
+            LOG.exception('registry.unhandled_error', extra={'method':self.command,'path':urlsplit(self.path).path[:300]})
             status=500; self.close_connection=True; self.reply(status,{'error':'internal registry error'})
         finally:
-            print(json.dumps({'method':self.command,'status':status,'actor':getattr(self,'actor',actor)}),flush=True)
+            # one structured access line per request (logging standard, AGENTS.md): no query string, no token, no IP
+            lvl=40 if status>=500 else 30 if status>=400 else 20
+            LOG.log(lvl,'http.request',extra={'method':self.command,'path':urlsplit(self.path).path[:300],'status':status,
+                    'actor':getattr(self,'actor',actor),'duration_ms':round((time.perf_counter()-t0)*1000,1)})
     def authenticated_request(self,parsed,path,digest):
         with psycopg.connect(self.server.dsn,row_factory=dict_row) as db:
             token=self.server.authenticate(db,digest)
@@ -834,6 +845,7 @@ def trace_retention_loop(dsn, days, interval=86400, first=300):
         time.sleep(interval)
 
 def main():
+    logkit.setup(app='artifact-registry')
     dsn=os.environ['ARTIFACTS_DATABASE_URL']
     days=int(os.getenv('ARTIFACTS_TRACE_RETENTION_DAYS','30'))
     if days>0: threading.Thread(target=trace_retention_loop,args=(dsn,days),daemon=True).start()
